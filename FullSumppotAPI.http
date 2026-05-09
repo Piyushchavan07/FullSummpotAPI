@@ -1,0 +1,6 @@
+@FullSumppotAPI_HostAddress = http://localhost:5230
+
+GET {{FullSumppotAPI_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
