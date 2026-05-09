@@ -1,0 +1,16 @@
+# Build folders
+bin/
+obj/
+
+# User files
+*.user
+*.suo
+
+# VS Code
+.vscode/
+
+# Development secrets
+appsettings.Development.json
+
+# Logs
+*.log
