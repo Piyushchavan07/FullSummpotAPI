@@ -1,11 +1,13 @@
 using Microsoft.AspNetCore.Mvc;
 using Oracle.ManagedDataAccess.Client;
 using FullSummpotAPI.Data;
+using Microsoft.AspNetCore.Authorization;
 
 namespace FullSummpotAPI.Controllers
 {
     [ApiController]
     [Route("api/[controller]")]
+    [Authorize]
     public class UserController : ControllerBase
     {
         private readonly OracleDbContext _db;

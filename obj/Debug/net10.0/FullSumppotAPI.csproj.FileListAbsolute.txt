@@ -6,7 +6,13 @@ C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\FullSumppotAPI.deps.json
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\FullSumppotAPI.runtimeconfig.json
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\FullSumppotAPI.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\FullSumppotAPI.pdb
-C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.AspNetCore.OpenApi.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.AspNetCore.Authentication.JwtBearer.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.Abstractions.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.JsonWebTokens.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.Logging.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.Protocols.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.Protocols.OpenIdConnect.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.IdentityModel.Tokens.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Microsoft.OpenApi.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Oracle.ManagedDataAccess.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Swashbuckle.AspNetCore.Swagger.dll
@@ -15,6 +21,7 @@ C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\Swashbuckle.AspNetCore.SwaggerUI
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\System.Configuration.ConfigurationManager.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\System.Diagnostics.PerformanceCounter.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\System.DirectoryServices.Protocols.dll
+C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\System.IdentityModel.Tokens.Jwt.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\System.Security.Cryptography.ProtectedData.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\runtimes\win\lib\net8.0\System.Diagnostics.PerformanceCounter.dll
 C:\Users\piyus\FullSumppotAPI\bin\Debug\net10.0\runtimes\linux\lib\net8.0\System.DirectoryServices.Protocols.dll
@@ -28,6 +35,7 @@ C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\FullSumppotAPI.AssemblyInfo.cs
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\FullSumppotAPI.csproj.CoreCompileInputs.cache
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\FullSumppotAPI.MvcApplicationPartsAssemblyInfo.cs
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\FullSumppotAPI.MvcApplicationPartsAssemblyInfo.cache
+C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\FullSumppotAPI.sourcelink.json
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\rjimswa.dswa.cache.json
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\rjsmrazor.dswa.cache.json
 C:\Users\piyus\FullSumppotAPI\obj\Debug\net10.0\rjsmcshtml.dswa.cache.json

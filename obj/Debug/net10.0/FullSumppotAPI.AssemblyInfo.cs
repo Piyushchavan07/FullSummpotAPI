@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FullSumppotAPI")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+21928c546b7e8db28e1fdf2f9079e12cc437435d")]
 [assembly: System.Reflection.AssemblyProductAttribute("FullSumppotAPI")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FullSumppotAPI")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
