@@ -1,6 +1,5 @@
-public class CreateLinkDto
+public class UpdateLinkDto
 {
     public string Title { get; set; } = "";
     public string Url { get; set; } = "";
-    public int CommunityId { get; set; }
 }

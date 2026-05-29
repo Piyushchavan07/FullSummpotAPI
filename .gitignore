@@ -9,8 +9,20 @@ obj/
 # VS Code
 .vscode/
 
-# Development secrets
+# Development secrets — never commit
 appsettings.Development.json
 
-# Logs
+# Logs and temp build output
 *.log
+build-output.txt
+build-output-utf8.txt
+run-output.txt
+
+# IDE cache
+*.lscache
+
+# Uploaded files — keep folder structure, ignore content
+wwwroot/uploads/**
+!wwwroot/uploads/.gitkeep
+!wwwroot/uploads/avatars/.gitkeep
+!wwwroot/uploads/banners/.gitkeep
