@@ -2,11 +2,10 @@ using System.ComponentModel.DataAnnotations;
 
 public class LoginDto
 {
+    /// <summary>Email address or 10-digit Indian mobile number.</summary>
     [Required]
-    [EmailAddress]
     public string Email { get; set; } = "";
 
     [Required]
-    [StringLength(100, MinimumLength = 1)]
     public string Password { get; set; } = "";
 }

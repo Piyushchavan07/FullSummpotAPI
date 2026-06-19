@@ -12,13 +12,18 @@ namespace FullSummpotAPI.Controllers
     public class UserController : ControllerBase
     {
         private readonly OracleDbContext _db;
+        private readonly PasswordService _passwordService;
         private static readonly HashSet<string> AllowedNiches = new(StringComparer.OrdinalIgnoreCase)
         {
             "Gaming","Tech","Education","Music","Comedy","Vlogging",
             "Finance","Fitness","Food","Travel","Other"
         };
 
-        public UserController(OracleDbContext db) => _db = db;
+        public UserController(OracleDbContext db, PasswordService passwordService)
+        {
+            _db = db;
+            _passwordService = passwordService;
+        }
 
         private int GetCurrentUserId()
         {
@@ -100,7 +105,8 @@ namespace FullSummpotAPI.Controllers
 
             var cmd = new OracleCommand(@"
                 SELECT USER_ID, USERNAME, EMAIL, CONTENT_NICHE,
-                       AVAILABLE_POINTS, AVATAR_URL, CREATED_AT
+                       AVAILABLE_POINTS, AVATAR_URL, CREATED_AT,
+                       PHONE_NUMBER, IS_EMAIL_VERIFIED, IS_PHONE_VERIFIED
                 FROM USERS WHERE USER_ID = :id", conn);
             cmd.BindByName = true;
             cmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
@@ -116,7 +122,10 @@ namespace FullSummpotAPI.Controllers
                 contentNiche   = reader["CONTENT_NICHE"] == DBNull.Value ? null : reader["CONTENT_NICHE"].ToString(),
                 availablePoints= reader["AVAILABLE_POINTS"] == DBNull.Value ? 0 : Convert.ToInt32(reader["AVAILABLE_POINTS"]),
                 avatarUrl      = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                createdAt      = reader["CREATED_AT"].ToString()
+                createdAt      = reader["CREATED_AT"] == DBNull.Value ? null : Convert.ToDateTime(reader["CREATED_AT"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                phoneNumber    = reader["PHONE_NUMBER"] == DBNull.Value ? null : reader["PHONE_NUMBER"].ToString(),
+                isEmailVerified = Convert.ToInt32(reader["IS_EMAIL_VERIFIED"]) == 1,
+                isPhoneVerified = Convert.ToInt32(reader["IS_PHONE_VERIFIED"]) == 1
             });
         }
 
@@ -162,7 +171,7 @@ namespace FullSummpotAPI.Controllers
                 contentNiche        = reader["CONTENT_NICHE"] == DBNull.Value ? null : reader["CONTENT_NICHE"].ToString(),
                 availablePoints     = Convert.ToInt32(reader["AVAILABLE_POINTS"]),
                 avatarUrl           = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                createdAt           = reader["CREATED_AT"].ToString(),
+                createdAt           = reader["CREATED_AT"] == DBNull.Value ? null : Convert.ToDateTime(reader["CREATED_AT"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
                 followersCount      = Convert.ToInt32(reader["FOLLOWERS_COUNT"]),
                 followingCount      = Convert.ToInt32(reader["FOLLOWING_COUNT"]),
                 communitiesCreated  = Convert.ToInt32(reader["COMMUNITIES_CREATED"]),
@@ -182,7 +191,7 @@ namespace FullSummpotAPI.Controllers
             if (!string.IsNullOrEmpty(dto.Username))
             {
                 if (dto.Username.Length < 3 || dto.Username.Length > 30)
-                    return BadRequest(new { message = "Username must be 3–30 characters." });
+                    return BadRequest(new { message = "Username must be 3ï¿½30 characters." });
 
                 // Only allow alphanumeric + underscore
                 if (!System.Text.RegularExpressions.Regex.IsMatch(dto.Username, @"^[a-zA-Z0-9_]+$"))
@@ -423,7 +432,7 @@ namespace FullSummpotAPI.Controllers
         [HttpPost("{id:int}/unblock")]
         public IActionResult Unblock(int id)
         {
-            // Placeholder — extend with a BLOCKS table if needed
+            // Placeholder ï¿½ extend with a BLOCKS table if needed
             return Ok(new { message = "User unblocked" });
         }
 
@@ -560,7 +569,7 @@ namespace FullSummpotAPI.Controllers
             using var conn = _db.GetConnection();
             conn.Open();
 
-            // Scoped to current user — prevents deleting other users notifications
+            // Scoped to current user ï¿½ prevents deleting other users notifications
             var cmd = new OracleCommand(
                 "DELETE FROM NOTIFICATIONS WHERE NOTIFICATION_ID = :id AND USER_ID = :userId", conn);
             cmd.BindByName = true;
@@ -571,11 +580,55 @@ namespace FullSummpotAPI.Controllers
             return Ok(new { success = true });
         }
 
+        // -- Change Password ------------------------------------------------------
+        [HttpPost("change-password")]
+        public IActionResult ChangePassword([FromBody] ChangePasswordDto dto)
+        {
+            int currentUserId = GetCurrentUserId();
+            if (currentUserId == 0) return Unauthorized();
+
+            if (string.IsNullOrWhiteSpace(dto.CurrentPassword) ||
+                string.IsNullOrWhiteSpace(dto.NewPassword))
+                return BadRequest(new { message = "Both passwords are required." });
+
+            if (dto.NewPassword.Length < 8)
+                return BadRequest(new { message = "New password must be at least 8 characters." });
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            var cmd = new OracleCommand(
+                "SELECT PASSWORD_HASH FROM USERS WHERE USER_ID = :idParam", conn);
+            cmd.BindByName = true;
+            cmd.Parameters.Add("idParam", OracleDbType.Int32).Value = currentUserId;
+            var storedHash = cmd.ExecuteScalar()?.ToString();
+
+            if (storedHash == null || !_passwordService.VerifyPassword(dto.CurrentPassword, storedHash))
+                return BadRequest(new { message = "Current password is incorrect." });
+
+            var newHash = _passwordService.HashPassword(dto.NewPassword);
+
+            var updateCmd = new OracleCommand(
+                "UPDATE USERS SET PASSWORD_HASH = :hashParam WHERE USER_ID = :idParam", conn);
+            updateCmd.BindByName = true;
+            updateCmd.Parameters.Add("hashParam", OracleDbType.Varchar2).Value = newHash;
+            updateCmd.Parameters.Add("idParam", OracleDbType.Int32).Value = currentUserId;
+            updateCmd.ExecuteNonQuery();
+
+            return Ok(new { message = "Password updated successfully." });
+        }
+
         // -- DTOs -----------------------------------------------------------------
         public class UpdateProfileDto
         {
             public string? Username { get; set; }
             public string? ContentNiche { get; set; }
         }
+    }
+
+    public class ChangePasswordDto
+    {
+        public string CurrentPassword { get; set; } = "";
+        public string NewPassword { get; set; } = "";
     }
 }

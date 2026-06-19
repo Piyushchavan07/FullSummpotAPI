@@ -30,7 +30,7 @@ namespace FullSummpotAPI.Controllers
             var cmd = new OracleCommand(@"
                 SELECT u.USERNAME, u.CONTENT_NICHE, u.AVAILABLE_POINTS,
                        u.POINTS_EARNED_TODAY, u.VIEWS_GIVEN_TODAY,
-                       u.COMMUNITIES_JOINED, u.AVATAR_URL,
+                       u.COMMUNITIES_JOINED, u.AVATAR_URL, u.ROLE,
                        (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWING_ID = :id AND STATUS = 'ACCEPTED') as FOLLOWERS_COUNT,
                        (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWER_ID = :id AND STATUS = 'ACCEPTED') as FOLLOWING_COUNT
                 FROM USERS u
@@ -45,7 +45,9 @@ namespace FullSummpotAPI.Controllers
 
             var commCmd = new OracleCommand(@"
                 SELECT c.COMMUNITY_ID, c.NAME, c.NICHE, c.CREATED_AT,
-                       u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR
+                       c.BANNER_URL,
+                       u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
+                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
                 FROM COMMUNITIES c
                 JOIN USERS u ON c.CREATED_BY = u.USER_ID
                 JOIN FOLLOWS f ON f.FOLLOWING_ID = u.USER_ID
@@ -59,12 +61,14 @@ namespace FullSummpotAPI.Controllers
             {
                 followingCommunities.Add(new
                 {
-                    communityId = Convert.ToInt32(commReader["COMMUNITY_ID"]),
-                    name = commReader["NAME"]?.ToString(),
-                    niche = commReader["NICHE"]?.ToString(),
-                    creatorName = commReader["CREATOR_NAME"]?.ToString(),
-                    creatorAvatar = commReader["CREATOR_AVATAR"]?.ToString(),
-                    createdAt = DateTime.SpecifyKind(
+                    communityId   = Convert.ToInt32(commReader["COMMUNITY_ID"]),
+                    name          = commReader["NAME"]?.ToString(),
+                    niche         = commReader["NICHE"]?.ToString(),
+                    bannerUrl     = commReader["BANNER_URL"] == DBNull.Value ? null : commReader["BANNER_URL"].ToString(),
+                    creatorName   = commReader["CREATOR_NAME"]?.ToString(),
+                    creatorAvatar = commReader["CREATOR_AVATAR"] == DBNull.Value ? null : commReader["CREATOR_AVATAR"].ToString(),
+                    latestLinkUrl = commReader["LATEST_LINK_URL"] == DBNull.Value ? null : commReader["LATEST_LINK_URL"].ToString(),
+                    createdAt     = DateTime.SpecifyKind(
                         commReader.GetDateTime(commReader.GetOrdinal("CREATED_AT")),
                         DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ")
                 });
@@ -81,6 +85,7 @@ namespace FullSummpotAPI.Controllers
                 followersCount = Convert.ToInt32(reader["FOLLOWERS_COUNT"]),
                 followingCount = Convert.ToInt32(reader["FOLLOWING_COUNT"]),
                 avatarUrl = reader["AVATAR_URL"]?.ToString(),
+                role = reader["ROLE"]?.ToString() ?? "USER",
                 followingCommunities
             });
         }

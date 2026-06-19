@@ -11,6 +11,11 @@ obj/
 
 # Development secrets - never commit
 appsettings.Development.json
+firebase-service-account.json
+*wallet*
+*.p12
+*.pem
+*.key
 
 # Logs and temp build output
 *.log

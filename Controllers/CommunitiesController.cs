@@ -47,7 +47,8 @@ namespace FullSummpotAPI.Controllers
                        u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
                        COUNT(cm.USER_ID) AS MEMBER_COUNT,
                        CASE WHEN SUM(CASE WHEN cm.USER_ID = :userIdParam THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS IS_MEMBER,
-                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR
+                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR,
+                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
                 FROM COMMUNITIES c
                 LEFT JOIN COMMUNITY_MEMBERS cm ON cm.COMMUNITY_ID = c.COMMUNITY_ID
                 LEFT JOIN USERS u ON u.USER_ID = c.CREATED_BY
@@ -71,7 +72,8 @@ namespace FullSummpotAPI.Controllers
                     isCreator    = reader.GetInt32(reader.GetOrdinal("IS_CREATOR")) == 1,
                     creatorId    = reader.GetInt32(reader.GetOrdinal("CREATED_BY")),
                     creatorName  = reader["CREATOR_NAME"]?.ToString(),
-                    creatorAvatar= reader["CREATOR_AVATAR"]?.ToString()
+                    creatorAvatar= reader["CREATOR_AVATAR"]?.ToString(),
+                    latestLinkUrl= reader["LATEST_LINK_URL"] == DBNull.Value ? null : reader["LATEST_LINK_URL"].ToString()
                 });
             }
             return Ok(communities);
@@ -92,7 +94,8 @@ namespace FullSummpotAPI.Controllers
                        u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
                        COUNT(cm.USER_ID) AS MEMBER_COUNT,
                        CASE WHEN SUM(CASE WHEN cm.USER_ID = :userIdParam THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS IS_MEMBER,
-                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR
+                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR,
+                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
                 FROM COMMUNITIES c
                 LEFT JOIN COMMUNITY_MEMBERS cm ON cm.COMMUNITY_ID = c.COMMUNITY_ID
                 LEFT JOIN USERS u ON u.USER_ID = c.CREATED_BY
@@ -117,7 +120,8 @@ namespace FullSummpotAPI.Controllers
                 isCreator    = reader.GetInt32(reader.GetOrdinal("IS_CREATOR")) == 1,
                 creatorId    = reader.GetInt32(reader.GetOrdinal("CREATED_BY")),
                 creatorName  = reader["CREATOR_NAME"]?.ToString(),
-                creatorAvatar= reader["CREATOR_AVATAR"]?.ToString()
+                creatorAvatar= reader["CREATOR_AVATAR"]?.ToString(),
+                latestLinkUrl= reader["LATEST_LINK_URL"] == DBNull.Value ? null : reader["LATEST_LINK_URL"].ToString()
             });
         }
 
@@ -187,22 +191,29 @@ namespace FullSummpotAPI.Controllers
             conn.Open();
 
             var check = new OracleCommand(
-                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :id AND CREATED_BY = :userId", conn);
+                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
             check.BindByName = true;
-            check.Parameters.Add("id",     OracleDbType.Int32).Value = id;
-            check.Parameters.Add("userId", OracleDbType.Int32).Value = userId;
+            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
+            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
             if (Convert.ToInt32(check.ExecuteScalar()) == 0)
                 return StatusCode(403, new { message = "Only the creator can edit this community." });
 
-            var cmd = new OracleCommand(@"
-                UPDATE COMMUNITIES SET NAME = :name, DESCRIPTION = :desc, NICHE = :niche
-                WHERE COMMUNITY_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("name",  OracleDbType.Varchar2).Value = dto.Name;
-            cmd.Parameters.Add("desc",  OracleDbType.Varchar2).Value = dto.Description;
-            cmd.Parameters.Add("niche", OracleDbType.Varchar2).Value = dto.Niche;
-            cmd.Parameters.Add("id",    OracleDbType.Int32).Value    = id;
-            cmd.ExecuteNonQuery();
+            try
+            {
+                var cmd = new OracleCommand(@"
+                    UPDATE COMMUNITIES SET NAME = :nameParam, DESCRIPTION = :descParam, NICHE = :nicheParam
+                    WHERE COMMUNITY_ID = :communityIdParam", conn);
+                cmd.BindByName = true;
+                cmd.Parameters.Add("nameParam",        OracleDbType.Varchar2, 100).Value  = dto.Name;
+                cmd.Parameters.Add("descParam",        OracleDbType.Varchar2, 500).Value  = dto.Description;
+                cmd.Parameters.Add("nicheParam",       OracleDbType.Varchar2, 100).Value  = dto.Niche;
+                cmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value          = id;
+                cmd.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Failed to update community.", detail = ex.Message });
+            }
 
             return Ok(new { message = "Community updated successfully" });
         }
@@ -286,17 +297,17 @@ namespace FullSummpotAPI.Controllers
             conn.Open();
 
             var check = new OracleCommand(
-                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :id AND CREATED_BY = :userId", conn);
+                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
             check.BindByName = true;
-            check.Parameters.Add("id",     OracleDbType.Int32).Value = id;
-            check.Parameters.Add("userId", OracleDbType.Int32).Value = userId;
+            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
+            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
             if (Convert.ToInt32(check.ExecuteScalar()) == 0)
                 return StatusCode(403, new { message = "Only the community creator can upload a banner." });
 
             // Delete old banner
-            var oldCmd = new OracleCommand("SELECT BANNER_URL FROM COMMUNITIES WHERE COMMUNITY_ID = :id", conn);
+            var oldCmd = new OracleCommand("SELECT BANNER_URL FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId", conn);
             oldCmd.BindByName = true;
-            oldCmd.Parameters.Add("id", OracleDbType.Int32).Value = id;
+            oldCmd.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
             var oldUrl = oldCmd.ExecuteScalar()?.ToString();
             if (!string.IsNullOrEmpty(oldUrl))
             {
@@ -316,13 +327,48 @@ namespace FullSummpotAPI.Controllers
             var publicUrl = $"/uploads/banners/{safeFileName}";
 
             var cmd = new OracleCommand(
-                "UPDATE COMMUNITIES SET BANNER_URL = :url WHERE COMMUNITY_ID = :id", conn);
+                "UPDATE COMMUNITIES SET BANNER_URL = :url WHERE COMMUNITY_ID = :communityId", conn);
             cmd.BindByName = true;
-            cmd.Parameters.Add("url", OracleDbType.Varchar2).Value = publicUrl;
-            cmd.Parameters.Add("id",  OracleDbType.Int32).Value    = id;
+            cmd.Parameters.Add("url",         OracleDbType.Varchar2).Value = publicUrl;
+            cmd.Parameters.Add("communityId", OracleDbType.Int32).Value    = id;
             cmd.ExecuteNonQuery();
 
             return Ok(new { bannerUrl = publicUrl });
+        }
+
+        [HttpDelete("{id:int}/banner")]
+        public IActionResult RemoveBanner(int id)
+        {
+            if (!TryGetUserId(out var userId)) return Unauthorized();
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            // Only the community creator can remove the banner
+            var check = new OracleCommand(
+                "SELECT BANNER_URL FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
+            check.BindByName = true;
+            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
+            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
+            var oldUrl = check.ExecuteScalar()?.ToString();
+            if (oldUrl == null)
+                return StatusCode(403, new { message = "Community not found or you are not the creator." });
+
+            // Delete the physical file if it exists
+            if (!string.IsNullOrEmpty(oldUrl))
+            {
+                var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", oldUrl.TrimStart('/'));
+                if (System.IO.File.Exists(filePath)) System.IO.File.Delete(filePath);
+            }
+
+            // Clear the banner_url in DB
+            var cmd = new OracleCommand(
+                "UPDATE COMMUNITIES SET BANNER_URL = NULL WHERE COMMUNITY_ID = :communityId", conn);
+            cmd.BindByName = true;
+            cmd.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
+            cmd.ExecuteNonQuery();
+
+            return Ok(new { message = "Banner removed" });
         }
     }
 }

@@ -6,6 +6,8 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using System.Text;
 using System.Threading.RateLimiting;
+using FirebaseAdmin;
+using Google.Apis.Auth.OAuth2;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -102,9 +104,47 @@ builder.Services.AddSwaggerGen(options =>
 // -- Database ------------------------------------------------------------------
 builder.Services.AddSingleton<OracleDbContext>();
 
+// -- HTTP clients --------------------------------------------------------------
+builder.Services.AddHttpClient("Fast2SMS", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+
 // -- Custom services -----------------------------------------------------------
 builder.Services.AddScoped<PasswordService>();
 builder.Services.AddScoped<JwtService>();
+builder.Services.AddScoped<FullSummpotAPI.Services.EmailService>();
+builder.Services.AddScoped<FullSummpotAPI.Services.SmsService>();
+builder.Services.AddScoped<FullSummpotAPI.Services.OtpService>();
+builder.Services.AddScoped<FullSummpotAPI.Services.AuthEventService>();
+
+// -- Firebase Admin SDK --------------------------------------------------------
+var firebaseCredentialsPath = builder.Configuration["Firebase:CredentialsPath"];
+if (!string.IsNullOrEmpty(firebaseCredentialsPath))
+{
+    var path = Path.IsPathRooted(firebaseCredentialsPath)
+        ? firebaseCredentialsPath
+        : Path.Combine(builder.Environment.ContentRootPath, firebaseCredentialsPath);
+
+    if (File.Exists(path))
+    {
+        if (FirebaseApp.DefaultInstance == null)
+        {
+            FirebaseApp.Create(new AppOptions
+            {
+                Credential = GoogleCredential.FromFile(path)
+            });
+        }
+    }
+    else
+    {
+        Console.WriteLine($"[Firebase Setup Warning]: Service account JSON file not found at {path}. Firebase verification will fail.");
+    }
+}
+else
+{
+    Console.WriteLine("[Firebase Setup Warning]: Firebase:CredentialsPath is not set in configuration. Firebase verification will fail.");
+}
 
 // -- JWT Authentication --------------------------------------------------------
 var jwtKey = builder.Configuration["Jwt:Key"]

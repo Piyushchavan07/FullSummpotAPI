@@ -12,7 +12,7 @@ public class JwtService
         _config = config;
     }
 
-    public string GenerateToken(string userId, string email)
+    public string GenerateToken(string userId, string email, string role)
     {
         var key = new SymmetricSecurityKey(
             Encoding.UTF8.GetBytes(_config["Jwt:Key"]!)
@@ -23,7 +23,8 @@ public class JwtService
         var claims = new[]
         {
             new Claim(ClaimTypes.NameIdentifier, userId),
-            new Claim(ClaimTypes.Email, email)
+            new Claim(ClaimTypes.Email, email),
+            new Claim(ClaimTypes.Role, role)
         };
 
         var token = new JwtSecurityToken(

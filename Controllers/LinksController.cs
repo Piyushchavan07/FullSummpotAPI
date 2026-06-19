@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Oracle.ManagedDataAccess.Client;
 using FullSummpotAPI.Data;
+using FullSummpotAPI.Hubs;
 using System.Security.Claims;
 
 namespace FullSummpotAPI.Controllers
@@ -12,10 +14,12 @@ namespace FullSummpotAPI.Controllers
     public class LinksController : ControllerBase
     {
         private readonly OracleDbContext _db;
+        private readonly IHubContext<ChatHub> _hub;
 
-        public LinksController(OracleDbContext db)
+        public LinksController(OracleDbContext db, IHubContext<ChatHub> hub)
         {
-            _db = db;
+            _db  = db;
+            _hub = hub;
         }
 
         [HttpPost]
@@ -223,6 +227,7 @@ namespace FullSummpotAPI.Controllers
             using var conn = _db.GetConnection();
             conn.Open();
 
+            // Check if this user has clicked before (used for first-click-only side effects)
             var checkCmd = new OracleCommand(
                 "SELECT COUNT(*) FROM LINK_CLICKS WHERE LINK_ID = :linkId AND CLICKER_USER_ID = :userId", conn);
             checkCmd.BindByName = true;
@@ -230,22 +235,36 @@ namespace FullSummpotAPI.Controllers
             checkCmd.Parameters.Add("userId", OracleDbType.Int32).Value = currentUserId;
             bool alreadyClicked = Convert.ToInt32(checkCmd.ExecuteScalar()) > 0;
 
+            // MERGE: insert on first click, increment CLICK_COUNT on subsequent clicks.
+            // This respects the UNIQUE(LINK_ID, CLICKER_USER_ID) constraint while still
+            // accumulating a per-supporter click count for the tier/supporters panel.
+            var mergeCmd = new OracleCommand(@"
+                MERGE INTO LINK_CLICKS tgt
+                USING (SELECT :linkId AS LINK_ID, :userId AS CLICKER_USER_ID FROM DUAL) src
+                ON (tgt.LINK_ID = src.LINK_ID AND tgt.CLICKER_USER_ID = src.CLICKER_USER_ID)
+                WHEN MATCHED THEN
+                    UPDATE SET tgt.CLICK_COUNT = NVL(tgt.CLICK_COUNT, 1) + 1,
+                               tgt.CLICKED_AT  = SYS_EXTRACT_UTC(SYSTIMESTAMP),
+                               tgt.REFERRER_PAGE = NVL(:referrer, tgt.REFERRER_PAGE)
+                WHEN NOT MATCHED THEN
+                    INSERT (LINK_ID, CLICKER_USER_ID, REFERRER_PAGE, CLICK_COUNT)
+                    VALUES (:linkId2, :userId2, :referrer2, 1)", conn);
+            mergeCmd.BindByName = true;
+            mergeCmd.Parameters.Add("linkId",    OracleDbType.Int32).Value    = linkId;
+            mergeCmd.Parameters.Add("userId",    OracleDbType.Int32).Value    = currentUserId;
+            mergeCmd.Parameters.Add("referrer",  OracleDbType.Varchar2).Value = string.IsNullOrEmpty(referrer) ? (object)DBNull.Value : referrer;
+            mergeCmd.Parameters.Add("linkId2",   OracleDbType.Int32).Value    = linkId;
+            mergeCmd.Parameters.Add("userId2",   OracleDbType.Int32).Value    = currentUserId;
+            mergeCmd.Parameters.Add("referrer2", OracleDbType.Varchar2).Value = string.IsNullOrEmpty(referrer) ? (object)DBNull.Value : referrer;
+            mergeCmd.ExecuteNonQuery();
+
+            // Only increment LINKS.CLICKS and send the creator notification on the first ever click
             if (!alreadyClicked)
             {
                 var updateCmd = new OracleCommand("UPDATE LINKS SET CLICKS = CLICKS + 1 WHERE LINK_ID = :linkId", conn);
                 updateCmd.BindByName = true;
                 updateCmd.Parameters.Add("linkId", OracleDbType.Int32).Value = linkId;
                 updateCmd.ExecuteNonQuery();
-
-                var insertCmd = new OracleCommand(@"
-                    INSERT INTO LINK_CLICKS (LINK_ID, CLICKER_USER_ID, REFERRER_PAGE)
-                    VALUES (:linkId, :userId, :referrer)", conn);
-                insertCmd.BindByName = true;
-                insertCmd.Parameters.Add("linkId", OracleDbType.Int32).Value = linkId;
-                insertCmd.Parameters.Add("userId", OracleDbType.Int32).Value = currentUserId;
-                insertCmd.Parameters.Add("referrer", OracleDbType.Varchar2).Value =
-                    string.IsNullOrEmpty(referrer) ? (object)DBNull.Value : referrer;
-                insertCmd.ExecuteNonQuery();
 
                 var isCreatorCmd = new OracleCommand(@"
                     SELECT COUNT(*) FROM (
@@ -259,7 +278,8 @@ namespace FullSummpotAPI.Controllers
 
                 if (isCreator)
                 {
-                    var ownerCmd = new OracleCommand("SELECT USER_ID FROM LINKS WHERE LINK_ID = :linkId", conn);
+                    var ownerCmd = new OracleCommand(
+                        "SELECT USER_ID FROM LINKS WHERE LINK_ID = :linkId", conn);
                     ownerCmd.BindByName = true;
                     ownerCmd.Parameters.Add("linkId", OracleDbType.Int32).Value = linkId;
                     var ownerIdObj = ownerCmd.ExecuteScalar();
@@ -269,19 +289,28 @@ namespace FullSummpotAPI.Controllers
                         int ownerId = Convert.ToInt32(ownerIdObj);
                         if (ownerId != currentUserId)
                         {
-                            var nameCmd = new OracleCommand("SELECT USERNAME FROM USERS WHERE USER_ID = :id", conn);
+                            var nameCmd = new OracleCommand(
+                                "SELECT USERNAME FROM USERS WHERE USER_ID = :id", conn);
                             nameCmd.BindByName = true;
                             nameCmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
                             var clickerName = nameCmd.ExecuteScalar()?.ToString() ?? "A creator";
+
+                            var titleCmd = new OracleCommand(
+                                "SELECT TITLE FROM LINKS WHERE LINK_ID = :linkId2", conn);
+                            titleCmd.BindByName = true;
+                            titleCmd.Parameters.Add("linkId2", OracleDbType.Int32).Value = linkId;
+                            var linkTitle = titleCmd.ExecuteScalar()?.ToString() ?? "your link";
+
+                            const int pointsAwarded = 1;
+                            var notifMsg = $"@{clickerName} (creator) clicked your link \"{linkTitle}\"! +{pointsAwarded} point{(pointsAwarded == 1 ? "" : "s")} 🌟";
 
                             var notifCmd = new OracleCommand(@"
                                 INSERT INTO NOTIFICATIONS (USER_ID, SENDER_ID, TYPE, MESSAGE)
                                 VALUES (:ownerId, :senderId, 'CREATOR_CLICKED_YOUR_LINK', :msg)", conn);
                             notifCmd.BindByName = true;
-                            notifCmd.Parameters.Add("ownerId", OracleDbType.Int32).Value = ownerId;
-                            notifCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = currentUserId;
-                            notifCmd.Parameters.Add("msg", OracleDbType.Varchar2).Value =
-                                $"@{clickerName} (creator) clicked your link!";
+                            notifCmd.Parameters.Add("ownerId",  OracleDbType.Int32).Value    = ownerId;
+                            notifCmd.Parameters.Add("senderId", OracleDbType.Int32).Value    = currentUserId;
+                            notifCmd.Parameters.Add("msg",      OracleDbType.Varchar2).Value = notifMsg;
                             notifCmd.ExecuteNonQuery();
                         }
                     }
@@ -335,17 +364,26 @@ namespace FullSummpotAPI.Controllers
             if (ownerId == currentUserId)
             {
                 var clickersCmd = new OracleCommand(@"
-                    SELECT u.USER_ID, u.USERNAME, u.AVATAR_URL, lc.CLICKED_AT, lc.REFERRER_PAGE,
+                    SELECT u.USER_ID, u.USERNAME, u.AVATAR_URL,
+                           lc.CLICKED_AT,
+                           lc.REFERRER_PAGE,
+                           NVL(lc.CLICK_COUNT, 1) as CLICK_COUNT,
                            CASE WHEN (SELECT COUNT(*) FROM COMMUNITIES WHERE CREATED_BY = u.USER_ID) > 0
                                 OR (SELECT COUNT(*) FROM LINKS WHERE USER_ID = u.USER_ID AND ROWNUM = 1) > 0
                                 THEN 1 ELSE 0 END as IS_CREATOR,
                            CASE WHEN u.USER_ID = :ownerId THEN 'SELF'
                                 ELSE NVL((SELECT STATUS FROM FOLLOWS WHERE FOLLOWER_ID = :ownerId AND FOLLOWING_ID = u.USER_ID), 'NONE')
-                           END as FOLLOW_STATUS
+                           END as FOLLOW_STATUS,
+                           CASE WHEN (
+                               SELECT COUNT(*) FROM LINK_CLICKS lc2
+                               JOIN LINKS l2 ON lc2.LINK_ID = l2.LINK_ID
+                               WHERE lc2.CLICKER_USER_ID = :ownerId
+                               AND l2.USER_ID = u.USER_ID
+                           ) > 0 THEN 1 ELSE 0 END as IS_MUTUAL
                     FROM LINK_CLICKS lc
                     JOIN USERS u ON u.USER_ID = lc.CLICKER_USER_ID
                     WHERE lc.LINK_ID = :linkId
-                    ORDER BY IS_CREATOR DESC, lc.CLICKED_AT DESC", conn);
+                    ORDER BY IS_CREATOR DESC, NVL(lc.CLICK_COUNT, 1) DESC, lc.CLICKED_AT DESC", conn);
                 clickersCmd.BindByName = true;
                 clickersCmd.Parameters.Add("ownerId", OracleDbType.Int32).Value = ownerId;
                 clickersCmd.Parameters.Add("linkId", OracleDbType.Int32).Value = linkId;
@@ -355,12 +393,14 @@ namespace FullSummpotAPI.Controllers
                 {
                     supporters.Add(new
                     {
-                        userId = Convert.ToInt32(reader["USER_ID"]),
-                        username = reader["USERNAME"].ToString(),
-                        avatarUrl = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                        clickedAt = reader.GetDateTime(reader.GetOrdinal("CLICKED_AT")).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                        userId       = Convert.ToInt32(reader["USER_ID"]),
+                        username     = reader["USERNAME"].ToString(),
+                        avatarUrl    = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
+                        clickedAt    = reader.GetDateTime(reader.GetOrdinal("CLICKED_AT")).ToString("yyyy-MM-ddTHH:mm:ssZ"),
                         referrerPage = reader["REFERRER_PAGE"] == DBNull.Value ? null : reader["REFERRER_PAGE"].ToString(),
-                        isCreator = Convert.ToInt32(reader["IS_CREATOR"]) == 1,
+                        clickCount   = Convert.ToInt32(reader["CLICK_COUNT"]),
+                        isCreator    = Convert.ToInt32(reader["IS_CREATOR"]) == 1,
+                        isMutual     = Convert.ToInt32(reader["IS_MUTUAL"]) == 1,
                         followStatus = reader["FOLLOW_STATUS"].ToString()
                     });
                 }
@@ -606,6 +646,177 @@ namespace FullSummpotAPI.Controllers
                 });
             }
             return Ok(list);
+        }
+
+        [HttpGet("user/{userId:int}")]
+        public IActionResult GetLinksByUser(int userId)
+        {
+            var currentUserStr = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(currentUserStr)) return Unauthorized();
+            int currentUserId = Convert.ToInt32(currentUserStr);
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            // Join LINK_CLICKS to know which links the current user has already supported,
+            // so the picker modal can show "Already supported ✓" per individual link.
+            var cmd = new OracleCommand(@"
+                SELECT l.LINK_ID, l.TITLE, l.URL, l.CLICKS, l.CREATED_AT,
+                       CASE WHEN lc.CLICKER_USER_ID IS NOT NULL THEN 1 ELSE 0 END AS IS_CLICKED_BY_ME
+                FROM LINKS l
+                LEFT JOIN LINK_CLICKS lc
+                       ON lc.LINK_ID = l.LINK_ID AND lc.CLICKER_USER_ID = :currentUserId
+                WHERE l.USER_ID = :userId
+                ORDER BY l.CREATED_AT DESC", conn);
+            cmd.BindByName = true;
+            cmd.Parameters.Add("currentUserId", OracleDbType.Int32).Value = currentUserId;
+            cmd.Parameters.Add("userId",        OracleDbType.Int32).Value = userId;
+
+            using var reader = cmd.ExecuteReader();
+            var list = new List<object>();
+            while (reader.Read())
+            {
+                list.Add(new
+                {
+                    linkId         = Convert.ToInt32(reader["LINK_ID"]),
+                    title          = reader["TITLE"].ToString(),
+                    url            = reader["URL"].ToString(),
+                    clicks         = Convert.ToInt32(reader["CLICKS"]),
+                    createdAt      = DateTime.SpecifyKind(
+                        reader.GetDateTime(reader.GetOrdinal("CREATED_AT")),
+                        DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    isClickedByMe  = Convert.ToInt32(reader["IS_CLICKED_BY_ME"]) == 1
+                });
+            }
+            return Ok(list); // empty array [] if user has no links — never 404
+        }
+
+        [HttpGet("latest/{userId:int}")]
+        public IActionResult GetLatestLink(int userId)
+        {
+            var currentUser = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(currentUser)) return Unauthorized();
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            var cmd = new OracleCommand(@"
+                SELECT l.LINK_ID, l.TITLE, l.URL, l.USER_ID, u.USERNAME
+                FROM LINKS l
+                JOIN USERS u ON u.USER_ID = l.USER_ID
+                WHERE l.USER_ID = :userId
+                ORDER BY l.CREATED_AT DESC
+                FETCH FIRST 1 ROWS ONLY", conn);
+            cmd.BindByName = true;
+            cmd.Parameters.Add("userId", OracleDbType.Int32).Value = userId;
+
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+                return NotFound(new { message = "This user has no links yet." });
+
+            return Ok(new
+            {
+                linkId   = Convert.ToInt32(reader["LINK_ID"]),
+                title    = reader["TITLE"].ToString(),
+                url      = reader["URL"].ToString(),
+                userId   = Convert.ToInt32(reader["USER_ID"]),
+                username = reader["USERNAME"].ToString()
+            });
+        }
+
+        [HttpGet("weekly-supporters")]
+        public IActionResult GetWeeklySupporters()
+        {
+            var currentUser = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(currentUser)) return Unauthorized();
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            var cmd = new OracleCommand(@"
+                SELECT RANK, USER_ID, USERNAME, AVATAR_URL, LINKS_SUPPORTED, TOTAL_CLICKS
+                FROM (
+                    SELECT
+                        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT lc.LINK_ID) DESC, COUNT(lc.CLICK_ID) DESC) AS RANK,
+                        u.USER_ID,
+                        u.USERNAME,
+                        u.AVATAR_URL,
+                        COUNT(DISTINCT lc.LINK_ID) AS LINKS_SUPPORTED,
+                        COUNT(lc.CLICK_ID)         AS TOTAL_CLICKS
+                    FROM LINK_CLICKS lc
+                    JOIN USERS u ON lc.CLICKER_USER_ID = u.USER_ID
+                    WHERE lc.CLICKED_AT >= TRUNC(SYSDATE + (5.5/24), 'IW') - (5.5/24)
+                    GROUP BY u.USER_ID, u.USERNAME, u.AVATAR_URL
+                )
+                WHERE RANK <= 50
+                ORDER BY RANK", conn);
+
+            using var reader = cmd.ExecuteReader();
+            var list = new List<object>();
+            while (reader.Read())
+            {
+                list.Add(new
+                {
+                    rank           = Convert.ToInt32(reader["RANK"]),
+                    userId         = Convert.ToInt32(reader["USER_ID"]),
+                    username       = reader["USERNAME"].ToString(),
+                    avatarUrl      = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
+                    linksSupported = Convert.ToInt32(reader["LINKS_SUPPORTED"]),
+                    totalClicks    = Convert.ToInt32(reader["TOTAL_CLICKS"])
+                });
+            }
+            return Ok(list);
+        }
+
+        [HttpPost("{linkId:int}/support-back-notify/{creatorUserId:int}")]
+        public async Task<IActionResult> NotifySupportBack(int linkId, int creatorUserId)
+        {
+            var userIdStr = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(userIdStr)) return Unauthorized();
+            int currentUserId = Convert.ToInt32(userIdStr);
+
+            if (currentUserId == creatorUserId)
+                return Ok(new { message = "Cannot notify yourself" });
+
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            // Get supporter username
+            var nameCmd = new OracleCommand("SELECT USERNAME FROM USERS WHERE USER_ID = :id", conn);
+            nameCmd.BindByName = true;
+            nameCmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
+            var supporterName = nameCmd.ExecuteScalar()?.ToString();
+            if (supporterName == null) return NotFound(new { message = "Supporter not found." });
+
+            // Get link title
+            var titleCmd = new OracleCommand("SELECT TITLE FROM LINKS WHERE LINK_ID = :linkId", conn);
+            titleCmd.BindByName = true;
+            titleCmd.Parameters.Add("linkId", OracleDbType.Int32).Value = linkId;
+            var linkTitle = titleCmd.ExecuteScalar()?.ToString();
+            if (linkTitle == null) return NotFound(new { message = "Link not found." });
+
+            // Insert notification
+            var message = $"@{supporterName} supported your link \"{linkTitle}\" back! 🔁";
+            var notifCmd = new OracleCommand(@"
+                INSERT INTO NOTIFICATIONS (USER_ID, SENDER_ID, TYPE, MESSAGE)
+                VALUES (:userId, :senderId, 'SUPPORT_BACK', :msg)", conn);
+            notifCmd.BindByName = true;
+            notifCmd.Parameters.Add("userId",   OracleDbType.Int32).Value    = creatorUserId;
+            notifCmd.Parameters.Add("senderId", OracleDbType.Int32).Value    = currentUserId;
+            notifCmd.Parameters.Add("msg",      OracleDbType.Varchar2).Value = message;
+            notifCmd.ExecuteNonQuery();
+
+            // Push real-time notification via SignalR (same group pattern as ChatHub)
+            await _hub.Clients.Group($"user_{creatorUserId}")
+                .SendAsync("ReceiveNotification", new
+                {
+                    type      = "SUPPORT_BACK",
+                    message   = message,
+                    senderId  = currentUserId,
+                    username  = supporterName
+                });
+
+            return Ok(new { message = "Notification sent" });
         }
     }
 

@@ -18,4 +18,9 @@ public class RegisterDto
 
     [Required]
     public string ContentNiche { get; set; } = "";
+
+    /// <summary>Optional phone number for SMS verification</summary>
+    [Phone]
+    public string? PhoneNumber { get; set; }
 }
+
