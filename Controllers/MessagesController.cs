@@ -1,7 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using FullSummpotAPI.Data;
 using FullSummpotAPI.Hubs;
 using System.Security.Claims;
@@ -13,17 +13,10 @@ namespace FullSummpotAPI.Controllers
     [Authorize]
     public class MessagesController : ControllerBase
     {
-        private readonly OracleDbContext _db;
+        private readonly NpgsqlDbContext _db;
         private readonly IHubContext<ChatHub> _hub;
-
-        public MessagesController(OracleDbContext db, IHubContext<ChatHub> hub)
-        {
-            _db = db;
-            _hub = hub;
-        }
-
-        private int GetCurrentUserId() =>
-            Convert.ToInt32(User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "0");
+        public MessagesController(NpgsqlDbContext db, IHubContext<ChatHub> hub) { _db = db; _hub = hub; }
+        private int GetCurrentUserId() => Convert.ToInt32(User.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "0");
 
         [HttpPost("send")]
         public IActionResult SendMessage([FromBody] SendMessageDto dto)
@@ -31,135 +24,118 @@ namespace FullSummpotAPI.Controllers
             int senderId = GetCurrentUserId();
             if (senderId == 0) return Unauthorized();
             if (senderId == dto.RecipientId) return BadRequest(new { message = "Cannot message yourself." });
-
-            // --- Input validation ---
-            if (string.IsNullOrWhiteSpace(dto.Content))
-                return BadRequest(new { message = "Message cannot be empty." });
+            if (string.IsNullOrWhiteSpace(dto.Content)) return BadRequest(new { message = "Message cannot be empty." });
             dto.Content = dto.Content.Trim();
-            if (dto.Content.Length > 1000)
-                return BadRequest(new { message = "Message must not exceed 1000 characters." });
+            if (dto.Content.Length > 1000) return BadRequest(new { message = "Message must not exceed 1000 characters." });
 
             using var conn = _db.GetConnection();
             conn.Open();
-
             try
             {
-                var mutualCmd = new OracleCommand(@"
-                    SELECT COUNT(*) FROM FOLLOWS f1
-                    JOIN FOLLOWS f2 ON f2.FOLLOWER_ID = f1.FOLLOWING_ID AND f2.FOLLOWING_ID = f1.FOLLOWER_ID
-                    WHERE f1.FOLLOWER_ID = :senderId AND f1.FOLLOWING_ID = :recipientId
-                    AND f1.STATUS = 'ACCEPTED' AND f2.STATUS = 'ACCEPTED'", conn);
-                mutualCmd.BindByName = true;
-                mutualCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                mutualCmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
-                bool isMutual = Convert.ToInt32(mutualCmd.ExecuteScalar()) > 0;
+                bool isMutual;
+                using (var mutualCmd = new NpgsqlCommand(@"
+                    SELECT COUNT(*) FROM follows f1
+                    JOIN follows f2 ON f2.follower_id = f1.following_id AND f2.following_id = f1.follower_id
+                    WHERE f1.follower_id = @sid AND f1.following_id = @rid
+                    AND f1.status = 'ACCEPTED' AND f2.status = 'ACCEPTED'", conn))
+                {
+                    mutualCmd.Parameters.AddWithValue("sid", senderId);
+                    mutualCmd.Parameters.AddWithValue("rid", dto.RecipientId);
+                    isMutual = Convert.ToInt32(mutualCmd.ExecuteScalar()) > 0;
+                }
 
                 if (isMutual)
                 {
-                    var existingCmd = new OracleCommand(@"
-                        SELECT c.CONVERSATION_ID FROM CONVERSATIONS c
-                        WHERE c.IS_ACTIVE = 1
-                        AND EXISTS (SELECT 1 FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = c.CONVERSATION_ID AND USER_ID = :senderId)
-                        AND EXISTS (SELECT 1 FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = c.CONVERSATION_ID AND USER_ID = :recipientId)
-                        AND (SELECT COUNT(*) FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = c.CONVERSATION_ID) = 2
-                        AND ROWNUM = 1", conn);
-                    existingCmd.BindByName = true;
-                    existingCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                    existingCmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
-                    var existingId = existingCmd.ExecuteScalar();
-
                     int conversationId;
-                    if (existingId != null && existingId != DBNull.Value)
+                    using (var existingCmd = new NpgsqlCommand(@"
+                        SELECT c.conversation_id FROM conversations c
+                        WHERE c.is_active = TRUE
+                        AND EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = c.conversation_id AND user_id = @sid)
+                        AND EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = c.conversation_id AND user_id = @rid)
+                        AND (SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = c.conversation_id) = 2
+                        LIMIT 1", conn))
                     {
-                        conversationId = Convert.ToInt32(existingId);
+                        existingCmd.Parameters.AddWithValue("sid", senderId);
+                        existingCmd.Parameters.AddWithValue("rid", dto.RecipientId);
+                        var existingId = existingCmd.ExecuteScalar();
+                        if (existingId != null && existingId != DBNull.Value)
+                        {
+                            conversationId = Convert.ToInt32(existingId);
+                        }
+                        else
+                        {
+                            using var createCmd = new NpgsqlCommand(
+                                "INSERT INTO conversations (is_active) VALUES (TRUE) RETURNING conversation_id", conn);
+                            conversationId = Convert.ToInt32(createCmd.ExecuteScalar());
+                            foreach (var pid in new[] { senderId, dto.RecipientId })
+                            {
+                                using var addP = new NpgsqlCommand(
+                                    "INSERT INTO conversation_participants (conversation_id, user_id) VALUES (@cid, @pid)", conn);
+                                addP.Parameters.AddWithValue("cid", conversationId);
+                                addP.Parameters.AddWithValue("pid", pid);
+                                addP.ExecuteNonQuery();
+                            }
+                        }
                     }
-                    else
-                    {
-                        var createCmd = new OracleCommand("INSERT INTO CONVERSATIONS (IS_ACTIVE) VALUES (1)", conn);
-                        createCmd.ExecuteNonQuery();
-                        var getIdCmd = new OracleCommand("SELECT MAX(CONVERSATION_ID) FROM CONVERSATIONS", conn);
-                        conversationId = Convert.ToInt32(getIdCmd.ExecuteScalar());
 
-                        var addP1 = new OracleCommand("INSERT INTO CONVERSATION_PARTICIPANTS (CONVERSATION_ID, USER_ID) VALUES (:convId, :participantId)", conn);
-                        addP1.BindByName = true;
-                        addP1.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                        addP1.Parameters.Add("participantId", OracleDbType.Int32).Value = senderId;
-                        addP1.ExecuteNonQuery();
-
-                        var addP2 = new OracleCommand("INSERT INTO CONVERSATION_PARTICIPANTS (CONVERSATION_ID, USER_ID) VALUES (:convId, :participantId)", conn);
-                        addP2.BindByName = true;
-                        addP2.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                        addP2.Parameters.Add("participantId", OracleDbType.Int32).Value = dto.RecipientId;
-                        addP2.ExecuteNonQuery();
-                    }
-
-                    var msgCmd = new OracleCommand(@"
-                        INSERT INTO MESSAGES (CONVERSATION_ID, SENDER_ID, CONTENT, SENT_AT)
-                        VALUES (:convId, :senderId, :msgContent, SYS_EXTRACT_UTC(SYSTIMESTAMP))", conn);
-                    msgCmd.BindByName = true;
-                    msgCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                    msgCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                    msgCmd.Parameters.Add("msgContent", OracleDbType.Varchar2).Value = dto.Content;
+                    using var msgCmd = new NpgsqlCommand(@"
+                        INSERT INTO messages (conversation_id, sender_id, content, sent_at)
+                        VALUES (@cid, @sid, @content, NOW() AT TIME ZONE 'UTC')", conn);
+                    msgCmd.Parameters.AddWithValue("cid",     conversationId);
+                    msgCmd.Parameters.AddWithValue("sid",     senderId);
+                    msgCmd.Parameters.AddWithValue("content", dto.Content);
                     msgCmd.ExecuteNonQuery();
 
-                    // Push real-time event to recipient
                     _ = _hub.Clients.Group($"user_{dto.RecipientId}").SendAsync("NewMessage", new { conversationId, senderId });
-
                     return Ok(new { conversationId, type = "direct" });
                 }
                 else
                 {
-                    var reqCheck = new OracleCommand(@"
-                        SELECT COUNT(*) FROM MESSAGE_REQUESTS
-                        WHERE SENDER_ID = :senderId AND RECIPIENT_ID = :recipientId", conn);
-                    reqCheck.BindByName = true;
-                    reqCheck.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                    reqCheck.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
-
-                    if (Convert.ToInt32(reqCheck.ExecuteScalar()) > 0)
+                    bool reqExists;
+                    using (var reqCheck = new NpgsqlCommand(@"
+                        SELECT COUNT(*) FROM message_requests
+                        WHERE sender_id = @sid AND recipient_id = @rid", conn))
                     {
-                        var updateReq = new OracleCommand(@"
-                            UPDATE MESSAGE_REQUESTS SET FIRST_MESSAGE = :msgContent, STATUS = 'PENDING'
-                            WHERE SENDER_ID = :senderId AND RECIPIENT_ID = :recipientId", conn);
-                        updateReq.BindByName = true;
-                        updateReq.Parameters.Add("msgContent", OracleDbType.Varchar2).Value = dto.Content;
-                        updateReq.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                        updateReq.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
+                        reqCheck.Parameters.AddWithValue("sid", senderId);
+                        reqCheck.Parameters.AddWithValue("rid", dto.RecipientId);
+                        reqExists = Convert.ToInt32(reqCheck.ExecuteScalar()) > 0;
+                    }
+
+                    if (reqExists)
+                    {
+                        using var updateReq = new NpgsqlCommand(@"
+                            UPDATE message_requests SET first_message = @content, status = 'PENDING'
+                            WHERE sender_id = @sid AND recipient_id = @rid", conn);
+                        updateReq.Parameters.AddWithValue("content", dto.Content);
+                        updateReq.Parameters.AddWithValue("sid",     senderId);
+                        updateReq.Parameters.AddWithValue("rid",     dto.RecipientId);
                         updateReq.ExecuteNonQuery();
                         return Ok(new { type = "request" });
                     }
 
-                    var reqCmd = new OracleCommand(@"
-                        INSERT INTO MESSAGE_REQUESTS (SENDER_ID, RECIPIENT_ID, FIRST_MESSAGE)
-                        VALUES (:senderId, :recipientId, :msgContent)", conn);
-                    reqCmd.BindByName = true;
-                    reqCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                    reqCmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
-                    reqCmd.Parameters.Add("msgContent", OracleDbType.Varchar2).Value = dto.Content;
+                    using var reqCmd = new NpgsqlCommand(@"
+                        INSERT INTO message_requests (sender_id, recipient_id, first_message)
+                        VALUES (@sid, @rid, @content)", conn);
+                    reqCmd.Parameters.AddWithValue("sid",     senderId);
+                    reqCmd.Parameters.AddWithValue("rid",     dto.RecipientId);
+                    reqCmd.Parameters.AddWithValue("content", dto.Content);
                     reqCmd.ExecuteNonQuery();
 
-                    var nameCmd = new OracleCommand("SELECT USERNAME FROM USERS WHERE USER_ID = :senderId", conn);
-                    nameCmd.BindByName = true;
-                    nameCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
+                    using var nameCmd = new NpgsqlCommand("SELECT username FROM users WHERE user_id = @sid", conn);
+                    nameCmd.Parameters.AddWithValue("sid", senderId);
                     var name = nameCmd.ExecuteScalar()?.ToString() ?? "Someone";
 
-                    var notifCmd = new OracleCommand(@"
-                        INSERT INTO NOTIFICATIONS (USER_ID, SENDER_ID, TYPE, MESSAGE)
-                        VALUES (:recipientId, :senderId, 'MESSAGE_REQUEST', :msgContent)", conn);
-                    notifCmd.BindByName = true;
-                    notifCmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = dto.RecipientId;
-                    notifCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-                    notifCmd.Parameters.Add("msgContent", OracleDbType.Varchar2).Value =
-                        $"@{name} sent you a message request.";
+                    using var notifCmd = new NpgsqlCommand(@"
+                        INSERT INTO notifications (user_id, sender_id, type, message)
+                        VALUES (@rid, @sid, 'MESSAGE_REQUEST', @msg)", conn);
+                    notifCmd.Parameters.AddWithValue("rid", dto.RecipientId);
+                    notifCmd.Parameters.AddWithValue("sid", senderId);
+                    notifCmd.Parameters.AddWithValue("msg", $"@{name} sent you a message request.");
                     notifCmd.ExecuteNonQuery();
-
                     return Ok(new { type = "request" });
                 }
             }
-            catch
-            {
-                return StatusCode(500, new { message = "An error occurred while sending the message." });
-            }
+            catch { return StatusCode(500, new { message = "An error occurred while sending the message." }); }
         }
 
         [HttpGet("conversations")]
@@ -167,49 +143,37 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT
-                    c.CONVERSATION_ID,
-                    u.USER_ID as OTHER_USER_ID,
-                    u.USERNAME as OTHER_USERNAME,
-                    u.AVATAR_URL as OTHER_AVATAR,
-                    (SELECT m2.CONTENT FROM MESSAGES m2
-                     WHERE m2.CONVERSATION_ID = c.CONVERSATION_ID
-                     AND m2.SENT_AT = (SELECT MAX(m3.SENT_AT) FROM MESSAGES m3 WHERE m3.CONVERSATION_ID = c.CONVERSATION_ID)
-                     AND ROWNUM = 1) as LAST_MESSAGE,
-                    (SELECT MAX(m4.SENT_AT) FROM MESSAGES m4 WHERE m4.CONVERSATION_ID = c.CONVERSATION_ID) as LAST_MESSAGE_AT,
-                    (SELECT COUNT(*) FROM MESSAGES m5
-                     WHERE m5.CONVERSATION_ID = c.CONVERSATION_ID
-                     AND m5.IS_READ = 0 AND m5.SENDER_ID != :currentUserId) as UNREAD_COUNT
-                FROM CONVERSATIONS c
-                JOIN CONVERSATION_PARTICIPANTS cp ON cp.CONVERSATION_ID = c.CONVERSATION_ID AND cp.USER_ID = :currentUserId
-                JOIN CONVERSATION_PARTICIPANTS cp2 ON cp2.CONVERSATION_ID = c.CONVERSATION_ID AND cp2.USER_ID != :currentUserId
-                JOIN USERS u ON u.USER_ID = cp2.USER_ID
-                WHERE c.IS_ACTIVE = 1
-                ORDER BY LAST_MESSAGE_AT DESC NULLS LAST", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("currentUserId", OracleDbType.Int32).Value = userId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT c.conversation_id,
+                       u.user_id AS other_user_id, u.username AS other_username, u.avatar_url AS other_avatar,
+                       (SELECT m2.content FROM messages m2 WHERE m2.conversation_id = c.conversation_id
+                        ORDER BY m2.sent_at DESC LIMIT 1) AS last_message,
+                       (SELECT MAX(m4.sent_at) FROM messages m4 WHERE m4.conversation_id = c.conversation_id) AS last_message_at,
+                       (SELECT COUNT(*) FROM messages m5 WHERE m5.conversation_id = c.conversation_id
+                        AND m5.is_read = FALSE AND m5.sender_id != @uid) AS unread_count
+                FROM conversations c
+                JOIN conversation_participants cp  ON cp.conversation_id  = c.conversation_id AND cp.user_id  = @uid
+                JOIN conversation_participants cp2 ON cp2.conversation_id = c.conversation_id AND cp2.user_id != @uid
+                JOIN users u ON u.user_id = cp2.user_id
+                WHERE c.is_active = TRUE
+                ORDER BY last_message_at DESC NULLS LAST", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
             while (reader.Read())
             {
                 list.Add(new
                 {
-                    conversationId = Convert.ToInt32(reader["CONVERSATION_ID"]),
-                    otherUserId = Convert.ToInt32(reader["OTHER_USER_ID"]),
-                    otherUsername = reader["OTHER_USERNAME"].ToString(),
-                    otherAvatar = reader["OTHER_AVATAR"] == DBNull.Value ? null : reader["OTHER_AVATAR"].ToString(),
-                    lastMessage = reader["LAST_MESSAGE"] == DBNull.Value ? null : reader["LAST_MESSAGE"].ToString(),
-                    lastMessageAt = reader["LAST_MESSAGE_AT"] == DBNull.Value ? null :
-                        DateTime.SpecifyKind(
-                            reader.GetDateTime(reader.GetOrdinal("LAST_MESSAGE_AT")),
-                            DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ"),  // ← FIXED: Utc not Local
-                    unreadCount = Convert.ToInt32(reader["UNREAD_COUNT"])
+                    conversationId = Convert.ToInt32(reader["conversation_id"]),
+                    otherUserId    = Convert.ToInt32(reader["other_user_id"]),
+                    otherUsername  = reader["other_username"].ToString(),
+                    otherAvatar    = reader["other_avatar"] == DBNull.Value ? null : reader["other_avatar"].ToString(),
+                    lastMessage    = reader["last_message"] == DBNull.Value ? null : reader["last_message"].ToString(),
+                    lastMessageAt  = reader["last_message_at"] == DBNull.Value ? null :
+                        DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("last_message_at")), DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    unreadCount    = Convert.ToInt32(reader["unread_count"])
                 });
             }
             return Ok(list);
@@ -220,49 +184,45 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var checkCmd = new OracleCommand("SELECT COUNT(*) FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = :convId AND USER_ID = :participantId", conn);
-            checkCmd.BindByName = true;
-            checkCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-            checkCmd.Parameters.Add("participantId", OracleDbType.Int32).Value = userId;
-            if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
-                return StatusCode(403, new { message = "Not a participant." });
+            using (var checkCmd = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = @cid AND user_id = @uid", conn))
+            {
+                checkCmd.Parameters.AddWithValue("cid", conversationId);
+                checkCmd.Parameters.AddWithValue("uid", userId);
+                if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
+                    return StatusCode(403, new { message = "Not a participant." });
+            }
 
-            var markCmd = new OracleCommand(@"
-                UPDATE MESSAGES SET IS_READ = 1
-                WHERE CONVERSATION_ID = :convId AND SENDER_ID != :participantId AND IS_READ = 0", conn);
-            markCmd.BindByName = true;
-            markCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-            markCmd.Parameters.Add("participantId", OracleDbType.Int32).Value = userId;
-            markCmd.ExecuteNonQuery();
+            using (var markCmd = new NpgsqlCommand(@"
+                UPDATE messages SET is_read = TRUE
+                WHERE conversation_id = @cid AND sender_id != @uid AND is_read = FALSE", conn))
+            {
+                markCmd.Parameters.AddWithValue("cid", conversationId);
+                markCmd.Parameters.AddWithValue("uid", userId);
+                markCmd.ExecuteNonQuery();
+            }
 
-            var cmd = new OracleCommand(@"
-                SELECT m.MESSAGE_ID, m.SENDER_ID, m.CONTENT, m.IS_READ, m.SENT_AT, u.USERNAME
-                FROM MESSAGES m
-                JOIN USERS u ON u.USER_ID = m.SENDER_ID
-                WHERE m.CONVERSATION_ID = :convId
-                ORDER BY m.SENT_AT ASC", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT m.message_id, m.sender_id, m.content, m.is_read, m.sent_at, u.username
+                FROM messages m JOIN users u ON u.user_id = m.sender_id
+                WHERE m.conversation_id = @cid ORDER BY m.sent_at ASC", conn);
+            cmd.Parameters.AddWithValue("cid", conversationId);
             using var reader = cmd.ExecuteReader();
             var messages = new List<object>();
             while (reader.Read())
             {
                 messages.Add(new
                 {
-                    messageId = Convert.ToInt32(reader["MESSAGE_ID"]),
-                    senderId = Convert.ToInt32(reader["SENDER_ID"]),
-                    username = reader["USERNAME"].ToString(),
-                    content = reader["CONTENT"].ToString(),
-                    isRead = Convert.ToInt32(reader["IS_READ"]) == 1,
-                    sentAt = DateTime.SpecifyKind(
-                        reader.GetDateTime(reader.GetOrdinal("SENT_AT")),
-                        DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ"),  // ← FIXED: Utc not Local
-                    isMine = Convert.ToInt32(reader["SENDER_ID"]) == userId
+                    messageId = Convert.ToInt32(reader["message_id"]),
+                    senderId  = Convert.ToInt32(reader["sender_id"]),
+                    username  = reader["username"].ToString(),
+                    content   = reader["content"].ToString(),
+                    isRead    = Convert.ToBoolean(reader["is_read"]),
+                    sentAt    = DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("sent_at")), DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    isMine    = Convert.ToInt32(reader["sender_id"]) == userId
                 });
             }
             return Ok(messages);
@@ -273,89 +233,42 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
-            // --- Input validation ---
-            if (string.IsNullOrWhiteSpace(dto.Content))
-                return BadRequest(new { message = "Message cannot be empty." });
+            if (string.IsNullOrWhiteSpace(dto.Content)) return BadRequest(new { message = "Message cannot be empty." });
             dto.Content = dto.Content.Trim();
-            if (dto.Content.Length > 1000)
-                return BadRequest(new { message = "Message must not exceed 1000 characters." });
+            if (dto.Content.Length > 1000) return BadRequest(new { message = "Message must not exceed 1000 characters." });
 
             using var conn = _db.GetConnection();
             conn.Open();
-
             try
             {
-                var checkCmd = new OracleCommand("SELECT COUNT(*) FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = :convId AND USER_ID = :participantId", conn);
-                checkCmd.BindByName = true;
-                checkCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                checkCmd.Parameters.Add("participantId", OracleDbType.Int32).Value = userId;
-                if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
-                    return StatusCode(403, new { message = "Not a participant." });
+                using (var checkCmd = new NpgsqlCommand(
+                    "SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = @cid AND user_id = @uid", conn))
+                {
+                    checkCmd.Parameters.AddWithValue("cid", conversationId);
+                    checkCmd.Parameters.AddWithValue("uid", userId);
+                    if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
+                        return StatusCode(403, new { message = "Not a participant." });
+                }
 
-                var cmd = new OracleCommand(@"
-                    INSERT INTO MESSAGES (CONVERSATION_ID, SENDER_ID, CONTENT, SENT_AT)
-                    VALUES (:convId, :senderId, :msgContent, SYS_EXTRACT_UTC(SYSTIMESTAMP))", conn);
-                cmd.BindByName = true;
-                cmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                cmd.Parameters.Add("senderId", OracleDbType.Int32).Value = userId;
-                cmd.Parameters.Add("msgContent", OracleDbType.Varchar2).Value = dto.Content;
+                using var cmd = new NpgsqlCommand(@"
+                    INSERT INTO messages (conversation_id, sender_id, content, sent_at)
+                    VALUES (@cid, @uid, @content, NOW() AT TIME ZONE 'UTC')", conn);
+                cmd.Parameters.AddWithValue("cid",     conversationId);
+                cmd.Parameters.AddWithValue("uid",     userId);
+                cmd.Parameters.AddWithValue("content", dto.Content);
                 cmd.ExecuteNonQuery();
 
-                // Find the other user in the conversation and push event
-                var otherCmd = new OracleCommand("SELECT USER_ID FROM CONVERSATION_PARTICIPANTS WHERE CONVERSATION_ID = :convId AND USER_ID != :me", conn);
-                otherCmd.BindByName = true;
-                otherCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                otherCmd.Parameters.Add("me", OracleDbType.Int32).Value = userId;
+                using var otherCmd = new NpgsqlCommand(
+                    "SELECT user_id FROM conversation_participants WHERE conversation_id = @cid AND user_id != @uid", conn);
+                otherCmd.Parameters.AddWithValue("cid", conversationId);
+                otherCmd.Parameters.AddWithValue("uid", userId);
                 var otherUserId = otherCmd.ExecuteScalar();
                 if (otherUserId != null && otherUserId != DBNull.Value)
-                {
                     _ = _hub.Clients.Group($"user_{otherUserId}").SendAsync("NewMessage", new { conversationId, senderId = userId });
-                }
 
                 return Ok(new { message = "Sent" });
             }
-            catch
-            {
-                return StatusCode(500, new { message = "An error occurred while sending the message." });
-            }
-        }
-
-        [HttpGet("requests/sent")]
-        public IActionResult GetSentRequests()
-        {
-            int userId = GetCurrentUserId();
-            if (userId == 0) return Unauthorized();
-
-            using var conn = _db.GetConnection();
-            conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT mr.REQUEST_ID, mr.RECIPIENT_ID, mr.FIRST_MESSAGE, mr.CREATED_AT, mr.STATUS,
-                       u.USERNAME, u.AVATAR_URL
-                FROM MESSAGE_REQUESTS mr
-                JOIN USERS u ON u.USER_ID = mr.RECIPIENT_ID
-                WHERE mr.SENDER_ID = :senderId AND mr.STATUS = 'PENDING'
-                ORDER BY mr.CREATED_AT DESC", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("senderId", OracleDbType.Int32).Value = userId;
-
-            using var reader = cmd.ExecuteReader();
-            var list = new List<object>();
-            while (reader.Read())
-            {
-                list.Add(new
-                {
-                    requestId = Convert.ToInt32(reader["REQUEST_ID"]),
-                    recipientId = Convert.ToInt32(reader["RECIPIENT_ID"]),
-                    username = reader["USERNAME"].ToString(),
-                    avatarUrl = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                    firstMessage = reader["FIRST_MESSAGE"].ToString(),
-                    status = reader["STATUS"].ToString(),
-                    createdAt = reader.GetDateTime(reader.GetOrdinal("CREATED_AT")).ToString("yyyy-MM-ddTHH:mm:ssZ")
-                });
-            }
-            return Ok(list);
+            catch { return StatusCode(500, new { message = "An error occurred while sending the message." }); }
         }
 
         [HttpGet("requests")]
@@ -363,32 +276,57 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT mr.REQUEST_ID, mr.SENDER_ID, mr.FIRST_MESSAGE, mr.CREATED_AT,
-                       u.USERNAME, u.AVATAR_URL
-                FROM MESSAGE_REQUESTS mr
-                JOIN USERS u ON u.USER_ID = mr.SENDER_ID
-                WHERE mr.RECIPIENT_ID = :recipientId AND mr.STATUS = 'PENDING'
-                ORDER BY mr.CREATED_AT DESC", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = userId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT mr.request_id, mr.sender_id, mr.first_message, mr.created_at, u.username, u.avatar_url
+                FROM message_requests mr JOIN users u ON u.user_id = mr.sender_id
+                WHERE mr.recipient_id = @uid AND mr.status = 'PENDING'
+                ORDER BY mr.created_at DESC", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
             while (reader.Read())
             {
                 list.Add(new
                 {
-                    requestId = Convert.ToInt32(reader["REQUEST_ID"]),
-                    senderId = Convert.ToInt32(reader["SENDER_ID"]),
-                    username = reader["USERNAME"].ToString(),
-                    avatarUrl = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                    firstMessage = reader["FIRST_MESSAGE"].ToString(),
-                    createdAt = reader.GetDateTime(reader.GetOrdinal("CREATED_AT")).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    requestId    = Convert.ToInt32(reader["request_id"]),
+                    senderId     = Convert.ToInt32(reader["sender_id"]),
+                    username     = reader["username"].ToString(),
+                    avatarUrl    = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(),
+                    firstMessage = reader["first_message"].ToString(),
+                    createdAt    = reader.GetDateTime(reader.GetOrdinal("created_at")).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                });
+            }
+            return Ok(list);
+        }
+
+        [HttpGet("requests/sent")]
+        public IActionResult GetSentRequests()
+        {
+            int userId = GetCurrentUserId();
+            if (userId == 0) return Unauthorized();
+            using var conn = _db.GetConnection();
+            conn.Open();
+            using var cmd = new NpgsqlCommand(@"
+                SELECT mr.request_id, mr.recipient_id, mr.first_message, mr.created_at, mr.status, u.username, u.avatar_url
+                FROM message_requests mr JOIN users u ON u.user_id = mr.recipient_id
+                WHERE mr.sender_id = @uid AND mr.status = 'PENDING'
+                ORDER BY mr.created_at DESC", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
+            using var reader = cmd.ExecuteReader();
+            var list = new List<object>();
+            while (reader.Read())
+            {
+                list.Add(new
+                {
+                    requestId    = Convert.ToInt32(reader["request_id"]),
+                    recipientId  = Convert.ToInt32(reader["recipient_id"]),
+                    username     = reader["username"].ToString(),
+                    avatarUrl    = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(),
+                    firstMessage = reader["first_message"].ToString(),
+                    status       = reader["status"].ToString(),
+                    createdAt    = reader.GetDateTime(reader.GetOrdinal("created_at")).ToString("yyyy-MM-ddTHH:mm:ssZ")
                 });
             }
             return Ok(list);
@@ -399,48 +337,45 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var reqCmd = new OracleCommand("SELECT SENDER_ID, FIRST_MESSAGE FROM MESSAGE_REQUESTS WHERE REQUEST_ID = :requestId AND RECIPIENT_ID = :recipientId AND STATUS = 'PENDING'", conn);
-            reqCmd.BindByName = true;
-            reqCmd.Parameters.Add("requestId", OracleDbType.Int32).Value = requestId;
-            reqCmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = userId;
+            int senderId; string firstMessage;
+            using (var reqCmd = new NpgsqlCommand(
+                "SELECT sender_id, first_message FROM message_requests WHERE request_id = @rid AND recipient_id = @uid AND status = 'PENDING'", conn))
+            {
+                reqCmd.Parameters.AddWithValue("rid", requestId);
+                reqCmd.Parameters.AddWithValue("uid", userId);
+                using var r = reqCmd.ExecuteReader();
+                if (!r.Read()) return NotFound(new { message = "Request not found." });
+                senderId     = Convert.ToInt32(r["sender_id"]);
+                firstMessage = r["first_message"].ToString()!;
+            }
 
-            using var reader = reqCmd.ExecuteReader();
-            if (!reader.Read()) return NotFound(new { message = "Request not found." });
-
-            int senderId = Convert.ToInt32(reader["SENDER_ID"]);
-            string firstMessage = reader["FIRST_MESSAGE"].ToString()!;
-            reader.Close();
-
-            var createCmd = new OracleCommand("INSERT INTO CONVERSATIONS (IS_ACTIVE) VALUES (1)", conn);
-            createCmd.ExecuteNonQuery();
-            var getIdCmd = new OracleCommand("SELECT MAX(CONVERSATION_ID) FROM CONVERSATIONS", conn);
-            int conversationId = Convert.ToInt32(getIdCmd.ExecuteScalar());
+            using var createCmd = new NpgsqlCommand(
+                "INSERT INTO conversations (is_active) VALUES (TRUE) RETURNING conversation_id", conn);
+            int conversationId = Convert.ToInt32(createCmd.ExecuteScalar());
 
             foreach (var pid in new[] { senderId, userId })
             {
-                var addP = new OracleCommand("INSERT INTO CONVERSATION_PARTICIPANTS (CONVERSATION_ID, USER_ID) VALUES (:convId, :participantId)", conn);
-                addP.BindByName = true;
-                addP.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-                addP.Parameters.Add("participantId", OracleDbType.Int32).Value = pid;
+                using var addP = new NpgsqlCommand(
+                    "INSERT INTO conversation_participants (conversation_id, user_id) VALUES (@cid, @pid)", conn);
+                addP.Parameters.AddWithValue("cid", conversationId);
+                addP.Parameters.AddWithValue("pid", pid);
                 addP.ExecuteNonQuery();
             }
 
-            var msgCmd = new OracleCommand(@"
-                INSERT INTO MESSAGES (CONVERSATION_ID, SENDER_ID, CONTENT, SENT_AT)
-                VALUES (:convId, :senderId, :msgContent, SYS_EXTRACT_UTC(SYSTIMESTAMP))", conn);
-            msgCmd.BindByName = true;
-            msgCmd.Parameters.Add("convId", OracleDbType.Int32).Value = conversationId;
-            msgCmd.Parameters.Add("senderId", OracleDbType.Int32).Value = senderId;
-            msgCmd.Parameters.Add("msgContent", OracleDbType.Varchar2).Value = firstMessage;
+            using var msgCmd = new NpgsqlCommand(@"
+                INSERT INTO messages (conversation_id, sender_id, content, sent_at)
+                VALUES (@cid, @sid, @content, NOW() AT TIME ZONE 'UTC')", conn);
+            msgCmd.Parameters.AddWithValue("cid",     conversationId);
+            msgCmd.Parameters.AddWithValue("sid",     senderId);
+            msgCmd.Parameters.AddWithValue("content", firstMessage);
             msgCmd.ExecuteNonQuery();
 
-            var updateCmd = new OracleCommand("UPDATE MESSAGE_REQUESTS SET STATUS = 'ACCEPTED' WHERE REQUEST_ID = :requestId", conn);
-            updateCmd.BindByName = true;
-            updateCmd.Parameters.Add("requestId", OracleDbType.Int32).Value = requestId;
+            using var updateCmd = new NpgsqlCommand(
+                "UPDATE message_requests SET status = 'ACCEPTED' WHERE request_id = @rid", conn);
+            updateCmd.Parameters.AddWithValue("rid", requestId);
             updateCmd.ExecuteNonQuery();
 
             return Ok(new { conversationId });
@@ -451,16 +386,13 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand("UPDATE MESSAGE_REQUESTS SET STATUS = 'DECLINED' WHERE REQUEST_ID = :requestId AND RECIPIENT_ID = :recipientId", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("requestId", OracleDbType.Int32).Value = requestId;
-            cmd.Parameters.Add("recipientId", OracleDbType.Int32).Value = userId;
+            using var cmd = new NpgsqlCommand(
+                "UPDATE message_requests SET status = 'DECLINED' WHERE request_id = @rid AND recipient_id = @uid", conn);
+            cmd.Parameters.AddWithValue("rid", requestId);
+            cmd.Parameters.AddWithValue("uid", userId);
             cmd.ExecuteNonQuery();
-
             return Ok(new { message = "Request declined" });
         }
 
@@ -469,36 +401,31 @@ namespace FullSummpotAPI.Controllers
         {
             int userId = GetCurrentUserId();
             if (userId == 0) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var msgCmd = new OracleCommand(@"
-                SELECT COUNT(*) FROM MESSAGES m
-                JOIN CONVERSATION_PARTICIPANTS cp ON cp.CONVERSATION_ID = m.CONVERSATION_ID
-                WHERE cp.USER_ID = :participantId AND m.SENDER_ID != :notSenderId AND m.IS_READ = 0", conn);
-            msgCmd.BindByName = true;
-            msgCmd.Parameters.Add("participantId", OracleDbType.Int32).Value = userId;
-            msgCmd.Parameters.Add("notSenderId", OracleDbType.Int32).Value = userId;
-            int unreadMessages = Convert.ToInt32(msgCmd.ExecuteScalar());
+            int unreadMessages;
+            using (var msgCmd = new NpgsqlCommand(@"
+                SELECT COUNT(*) FROM messages m
+                JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id
+                WHERE cp.user_id = @uid AND m.sender_id != @uid AND m.is_read = FALSE", conn))
+            {
+                msgCmd.Parameters.AddWithValue("uid", userId);
+                unreadMessages = Convert.ToInt32(msgCmd.ExecuteScalar());
+            }
 
-            var reqCmd = new OracleCommand("SELECT COUNT(*) FROM MESSAGE_REQUESTS WHERE RECIPIENT_ID = :reqRecipientId AND STATUS = 'PENDING'", conn);
-            reqCmd.BindByName = true;
-            reqCmd.Parameters.Add("reqRecipientId", OracleDbType.Int32).Value = userId;
-            int pendingRequests = Convert.ToInt32(reqCmd.ExecuteScalar());
+            int pendingRequests;
+            using (var reqCmd = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM message_requests WHERE recipient_id = @uid AND status = 'PENDING'", conn))
+            {
+                reqCmd.Parameters.AddWithValue("uid", userId);
+                pendingRequests = Convert.ToInt32(reqCmd.ExecuteScalar());
+            }
 
             return Ok(new { unreadMessages, pendingRequests, total = unreadMessages + pendingRequests });
         }
     }
 
-    public class SendMessageDto
-    {
-        public int RecipientId { get; set; }
-        public string Content { get; set; } = "";
-    }
-
-    public class MessageContentDto
-    {
-        public string Content { get; set; } = "";
-    }
+    public class SendMessageDto  { public int RecipientId { get; set; } public string Content { get; set; } = ""; }
+    public class MessageContentDto { public string Content { get; set; } = ""; }
 }

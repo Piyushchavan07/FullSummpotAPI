@@ -3,101 +3,70 @@ using FullSummpotAPI.DTOs;
 using FullSummpotAPI.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using System.Security.Claims;
 
 namespace FullSummpotAPI.Controllers
 {
-    /// <summary>
-    /// Account Center — verified contacts, add backup email/phone (Instagram-style).
-    /// One phone per account. Multiple emails per account via USER_EMAILS.
-    /// </summary>
     [ApiController]
     [Route("api/[controller]")]
     [Authorize]
     public class AccountController : ControllerBase
     {
-        private readonly OracleDbContext _db;
+        private readonly NpgsqlDbContext _db;
         private readonly OtpService _otp;
         private readonly EmailService _email;
         private readonly SmsService _sms;
         private readonly AuthEventService _authEvents;
         private readonly IWebHostEnvironment _env;
 
-        public AccountController(OracleDbContext db, OtpService otp, EmailService email,
+        public AccountController(NpgsqlDbContext db, OtpService otp, EmailService email,
             SmsService sms, AuthEventService authEvents, IWebHostEnvironment env)
-        {
-            _db = db;
-            _otp = otp;
-            _email = email;
-            _sms = sms;
-            _authEvents = authEvents;
-            _env = env;
-        }
+        { _db = db; _otp = otp; _email = email; _sms = sms; _authEvents = authEvents; _env = env; }
 
         private int UserId => Convert.ToInt32(User.FindFirst(ClaimTypes.NameIdentifier)!.Value);
 
-        // GET /api/Account/contacts
         [HttpGet("contacts")]
         public IActionResult GetContacts()
         {
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var userCmd = new OracleCommand(@"
-                SELECT EMAIL, PHONE_NUMBER, IS_EMAIL_VERIFIED, IS_PHONE_VERIFIED, IS_VERIFIED
-                FROM USERS WHERE USER_ID = :id", conn);
-            userCmd.BindByName = true;
-            userCmd.Parameters.Add("id", OracleDbType.Int32).Value = UserId;
+            using var userCmd = new NpgsqlCommand(@"
+                SELECT email, phone_number, is_email_verified, is_phone_verified, is_verified
+                FROM users WHERE user_id = @id", conn);
+            userCmd.Parameters.AddWithValue("id", UserId);
             using var reader = userCmd.ExecuteReader();
             if (!reader.Read()) return NotFound();
 
-            var primaryEmail = reader["EMAIL"]?.ToString() ?? "";
-            var phone = reader["PHONE_NUMBER"] == DBNull.Value ? null : reader["PHONE_NUMBER"]?.ToString();
-            bool emailVerified = Convert.ToInt32(reader["IS_EMAIL_VERIFIED"]) == 1;
-            bool phoneVerified = Convert.ToInt32(reader["IS_PHONE_VERIFIED"]) == 1;
+            var primaryEmail  = reader["email"]?.ToString() ?? "";
+            var phone         = reader["phone_number"] == DBNull.Value ? null : reader["phone_number"]?.ToString();
+            bool emailVerified = Convert.ToBoolean(reader["is_email_verified"]);
+            reader.Close();
 
             var emails = new List<object>
             {
-                new
-                {
-                    email = primaryEmail,
-                    masked = ContactMaskHelper.MaskEmail(primaryEmail),
-                    isPrimary = true,
-                    isVerified = emailVerified
-                }
+                new { email = primaryEmail, masked = ContactMaskHelper.MaskEmail(primaryEmail), isPrimary = true, isVerified = emailVerified }
             };
 
-            var extraCmd = new OracleCommand(@"
-                SELECT EMAIL, IS_VERIFIED FROM USER_EMAILS
-                WHERE USER_ID = :id AND IS_PRIMARY = 0
-                ORDER BY CREATED_AT", conn);
-            extraCmd.BindByName = true;
-            extraCmd.Parameters.Add("id", OracleDbType.Int32).Value = UserId;
-            using var extraReader = extraCmd.ExecuteReader();
-            while (extraReader.Read())
+            try
             {
-                var e = extraReader["EMAIL"].ToString()!;
-                emails.Add(new
+                using var extraCmd = new NpgsqlCommand(@"
+                    SELECT email, is_verified FROM user_emails
+                    WHERE user_id = @id AND is_primary = FALSE ORDER BY created_at", conn);
+                extraCmd.Parameters.AddWithValue("id", UserId);
+                using var extraReader = extraCmd.ExecuteReader();
+                while (extraReader.Read())
                 {
-                    email = e,
-                    masked = ContactMaskHelper.MaskEmail(e),
-                    isPrimary = false,
-                    isVerified = Convert.ToInt32(extraReader["IS_VERIFIED"]) == 1
-                });
+                    var e = extraReader["email"].ToString()!;
+                    emails.Add(new { email = e, masked = ContactMaskHelper.MaskEmail(e), isPrimary = false, isVerified = Convert.ToBoolean(extraReader["is_verified"]) });
+                }
             }
+            catch { }
 
-            return Ok(new
-            {
-                emails,
-                phone = (object?)null,
-                canResetViaEmail = emailVerified,
-                canResetViaPhone = false,
-                recoveryHint = "You can reset your password via email."
-            });
+            return Ok(new { emails, phone = (object?)null, canResetViaEmail = emailVerified, canResetViaPhone = false, recoveryHint = "You can reset your password via email." });
         }
 
-        // POST /api/Account/add-email
         [HttpPost("add-email")]
         public async Task<IActionResult> AddEmail([FromBody] AddContactEmailDto dto)
         {
@@ -107,23 +76,21 @@ namespace FullSummpotAPI.Controllers
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var takenCmd = new OracleCommand(
-                "SELECT COUNT(*) FROM USERS WHERE LOWER(EMAIL) = :e", conn);
-            takenCmd.BindByName = true;
-            takenCmd.Parameters.Add("e", newEmail);
-            if (Convert.ToInt32(takenCmd.ExecuteScalar()) > 0)
-                return BadRequest(new { message = "That email is already in use." });
+            using (var takenCmd = new NpgsqlCommand("SELECT COUNT(*) FROM users WHERE LOWER(email) = @e", conn))
+            {
+                takenCmd.Parameters.AddWithValue("e", newEmail);
+                if (Convert.ToInt32(takenCmd.ExecuteScalar()) > 0)
+                    return BadRequest(new { message = "That email is already in use." });
+            }
 
             try
             {
-                var checkExtra = new OracleCommand(
-                    "SELECT COUNT(*) FROM USER_EMAILS WHERE LOWER(EMAIL) = :e", conn);
-                checkExtra.BindByName = true;
-                checkExtra.Parameters.Add("e", newEmail);
+                using var checkExtra = new NpgsqlCommand("SELECT COUNT(*) FROM user_emails WHERE LOWER(email) = @e", conn);
+                checkExtra.Parameters.AddWithValue("e", newEmail);
                 if (Convert.ToInt32(checkExtra.ExecuteScalar()) > 0)
                     return BadRequest(new { message = "That email is already in use." });
             }
-            catch { /* USER_EMAILS may not exist until migration */ }
+            catch { }
 
             var cooldown = _otp.GetResendCooldownSeconds(conn, "email", newEmail, "ADD_EMAIL");
             if (cooldown > 0)
@@ -132,7 +99,6 @@ namespace FullSummpotAPI.Controllers
             var otp = OtpService.Generate();
             await _otp.StoreEmailOtpAsync(conn, newEmail, otp, "ADD_EMAIL");
             await _email.SendOtpEmailAsync(newEmail, otp, "ADD_EMAIL");
-
             _authEvents.Log(conn, UserId, "ADD_EMAIL_REQUESTED", newEmail);
 
             var response = new { message = "Verification code sent.", maskedContact = ContactMaskHelper.MaskEmail(newEmail), resendCooldownSeconds = OtpService.ResendCooldownSeconds };
@@ -141,7 +107,6 @@ namespace FullSummpotAPI.Controllers
             return Ok(response);
         }
 
-        // POST /api/Account/verify-email
         [HttpPost("verify-email")]
         public IActionResult VerifyAddEmail([FromBody] VerifyAddContactEmailDto dto)
         {
@@ -156,15 +121,14 @@ namespace FullSummpotAPI.Controllers
 
             try
             {
-                var insertCmd = new OracleCommand(@"
-                    INSERT INTO USER_EMAILS (USER_ID, EMAIL, IS_PRIMARY, IS_VERIFIED)
-                    VALUES (:userId, :email, 0, 1)", conn);
-                insertCmd.BindByName = true;
-                insertCmd.Parameters.Add("userId", OracleDbType.Int32).Value = UserId;
-                insertCmd.Parameters.Add("email", newEmail);
+                using var insertCmd = new NpgsqlCommand(@"
+                    INSERT INTO user_emails (user_id, email, is_primary, is_verified)
+                    VALUES (@uid, @email, FALSE, TRUE)", conn);
+                insertCmd.Parameters.AddWithValue("uid",   UserId);
+                insertCmd.Parameters.AddWithValue("email", newEmail);
                 insertCmd.ExecuteNonQuery();
             }
-            catch (OracleException ex) when (ex.Number == 1)
+            catch (PostgresException ex) when (ex.SqlState == "23505")
             {
                 return BadRequest(new { message = "That email is already linked to an account." });
             }
@@ -173,7 +137,6 @@ namespace FullSummpotAPI.Controllers
             return Ok(new { message = "Email added and verified. You can now sign in with it." });
         }
 
-        // POST /api/Account/add-phone
         [HttpPost("add-phone")]
         public async Task<IActionResult> AddPhone([FromBody] AddContactPhoneDto dto)
         {
@@ -184,33 +147,32 @@ namespace FullSummpotAPI.Controllers
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var takenCmd = new OracleCommand(@"
-                SELECT COUNT(*) FROM USERS
-                WHERE USER_ID != :me
-                  AND REGEXP_REPLACE(PHONE_NUMBER, '[^0-9]', '') IN (:ph, '91' || :ph)", conn);
-            takenCmd.BindByName = true;
-            takenCmd.Parameters.Add("me", OracleDbType.Int32).Value = UserId;
-            takenCmd.Parameters.Add("ph", phone);
-            if (Convert.ToInt32(takenCmd.ExecuteScalar()) > 0)
-                return BadRequest(new { message = "This number is already linked to another account." });
+            using (var takenCmd = new NpgsqlCommand(@"
+                SELECT COUNT(*) FROM users
+                WHERE user_id != @me
+                  AND REGEXP_REPLACE(phone_number, '[^0-9]', '', 'g') IN (@ph, '91' || @ph)", conn))
+            {
+                takenCmd.Parameters.AddWithValue("me", UserId);
+                takenCmd.Parameters.AddWithValue("ph", phone);
+                if (Convert.ToInt32(takenCmd.ExecuteScalar()) > 0)
+                    return BadRequest(new { message = "This number is already linked to another account." });
+            }
 
             var cooldown = _otp.GetResendCooldownSeconds(conn, "phone", phone, "ADD_PHONE");
             if (cooldown > 0)
                 return StatusCode(429, new { message = $"Wait {cooldown}s before requesting another code.", resendCooldownSeconds = cooldown });
 
-            // Save unverified phone on account, verify via OTP next step
-            var updateCmd = new OracleCommand(@"
-                UPDATE USERS SET PHONE_NUMBER = :ph, IS_PHONE_VERIFIED = 0
-                WHERE USER_ID = :id", conn);
-            updateCmd.BindByName = true;
-            updateCmd.Parameters.Add("ph", phone);
-            updateCmd.Parameters.Add("id", OracleDbType.Int32).Value = UserId;
-            updateCmd.ExecuteNonQuery();
+            using (var updateCmd = new NpgsqlCommand(
+                "UPDATE users SET phone_number = @ph, is_phone_verified = FALSE WHERE user_id = @id", conn))
+            {
+                updateCmd.Parameters.AddWithValue("ph", phone);
+                updateCmd.Parameters.AddWithValue("id", UserId);
+                updateCmd.ExecuteNonQuery();
+            }
 
-            var otp = OtpService.Generate();
+            var otp    = OtpService.Generate();
             await _otp.StorePhoneOtpAsync(conn, phone, otp, "ADD_PHONE");
             var devOtp = await _sms.SendOtpSmsAsync(phone, otp, "VERIFY_PHONE");
-
             _authEvents.Log(conn, UserId, "ADD_PHONE_REQUESTED", phone);
 
             var response = new { message = "Verification code sent.", maskedContact = ContactMaskHelper.MaskPhone(phone), resendCooldownSeconds = OtpService.ResendCooldownSeconds };
@@ -219,7 +181,6 @@ namespace FullSummpotAPI.Controllers
             return Ok(response);
         }
 
-        // POST /api/Account/verify-phone
         [HttpPost("verify-phone")]
         public IActionResult VerifyAddPhone([FromBody] VerifyAddContactPhoneDto dto)
         {
@@ -230,23 +191,23 @@ namespace FullSummpotAPI.Controllers
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var ownerCmd = new OracleCommand(@"
-                SELECT COUNT(*) FROM USERS WHERE USER_ID = :id
-                  AND REGEXP_REPLACE(PHONE_NUMBER, '[^0-9]', '') IN (:ph, '91' || :ph)", conn);
-            ownerCmd.BindByName = true;
-            ownerCmd.Parameters.Add("id", OracleDbType.Int32).Value = UserId;
-            ownerCmd.Parameters.Add("ph", phone);
-            if (Convert.ToInt32(ownerCmd.ExecuteScalar()) == 0)
-                return BadRequest(new { message = "Phone does not match your account. Request a new code first." });
+            using (var ownerCmd = new NpgsqlCommand(@"
+                SELECT COUNT(*) FROM users WHERE user_id = @id
+                  AND REGEXP_REPLACE(phone_number, '[^0-9]', '', 'g') IN (@ph, '91' || @ph)", conn))
+            {
+                ownerCmd.Parameters.AddWithValue("id", UserId);
+                ownerCmd.Parameters.AddWithValue("ph", phone);
+                if (Convert.ToInt32(ownerCmd.ExecuteScalar()) == 0)
+                    return BadRequest(new { message = "Phone does not match your account. Request a new code first." });
+            }
 
             if (!_otp.ValidatePhoneOtp(conn, phone, dto.Otp, "ADD_PHONE"))
                 return BadRequest(new { message = "Invalid or expired code." });
 
-            var verifyCmd = new OracleCommand(
-                "UPDATE USERS SET IS_PHONE_VERIFIED = 1, PHONE_NUMBER = :ph WHERE USER_ID = :id", conn);
-            verifyCmd.BindByName = true;
-            verifyCmd.Parameters.Add("ph", phone);
-            verifyCmd.Parameters.Add("id", OracleDbType.Int32).Value = UserId;
+            using var verifyCmd = new NpgsqlCommand(
+                "UPDATE users SET is_phone_verified = TRUE, phone_number = @ph WHERE user_id = @id", conn);
+            verifyCmd.Parameters.AddWithValue("ph", phone);
+            verifyCmd.Parameters.AddWithValue("id", UserId);
             verifyCmd.ExecuteNonQuery();
 
             _authEvents.Log(conn, UserId, "ADD_PHONE_VERIFIED", phone);

@@ -12,7 +12,6 @@ using Google.Apis.Auth.OAuth2;
 var builder = WebApplication.CreateBuilder(args);
 
 // -- CORS ---------------------------------------------------------------------
-// Origin is read from config so it can differ per environment without code changes
 var allowedOrigins = builder.Configuration["AllowedFrontendOrigins"]
     ?? "http://localhost:5173";
 
@@ -25,56 +24,52 @@ builder.Services.AddCors(options =>
               .AllowCredentials());
 });
 
-// -- SignalR -------------------------------------------------------------------
+// -- SignalR ------------------------------------------------------------------
 builder.Services.AddSignalR();
 
-// -- Rate Limiting -------------------------------------------------------------
+// -- Rate Limiting ------------------------------------------------------------
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-    // /api/Auth/login — 10 requests per minute per IP
     options.AddPolicy("login", httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
             partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             factory: _ => new FixedWindowRateLimiterOptions
             {
-                PermitLimit        = 10,
-                Window             = TimeSpan.FromMinutes(1),
+                PermitLimit          = 10,
+                Window               = TimeSpan.FromMinutes(1),
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                QueueLimit         = 0
+                QueueLimit           = 0
             }));
 
-    // /api/Auth/register — 5 requests per minute per IP
     options.AddPolicy("register", httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
             partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             factory: _ => new FixedWindowRateLimiterOptions
             {
-                PermitLimit        = 5,
-                Window             = TimeSpan.FromMinutes(1),
+                PermitLimit          = 5,
+                Window               = TimeSpan.FromMinutes(1),
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                QueueLimit         = 0
+                QueueLimit           = 0
             }));
 
-    // All other endpoints — 100 requests per minute per IP (global default)
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
             partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             factory: _ => new FixedWindowRateLimiterOptions
             {
-                PermitLimit        = 100,
-                Window             = TimeSpan.FromMinutes(1),
+                PermitLimit          = 100,
+                Window               = TimeSpan.FromMinutes(1),
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                QueueLimit         = 0
+                QueueLimit           = 0
             }));
 });
 
-// -- MVC / Swagger -------------------------------------------------------------
+// -- MVC / Swagger ------------------------------------------------------------
 builder.Services.AddControllers();
 builder.WebHost.ConfigureKestrel(options =>
 {
-    // 10 MB max request body for file uploads
     options.Limits.MaxRequestBodySize = 10 * 1024 * 1024;
 });
 builder.Services.AddEndpointsApiExplorer();
@@ -82,12 +77,12 @@ builder.Services.AddSwaggerGen(options =>
 {
     options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
-        Name        = "Authorization",
-        Type        = SecuritySchemeType.Http,
-        Scheme      = "Bearer",
-        BearerFormat= "JWT",
-        In          = ParameterLocation.Header,
-        Description = "Enter your JWT token"
+        Name         = "Authorization",
+        Type         = SecuritySchemeType.Http,
+        Scheme       = "Bearer",
+        BearerFormat = "JWT",
+        In           = ParameterLocation.Header,
+        Description  = "Enter your JWT token"
     });
     options.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
@@ -101,16 +96,16 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
-// -- Database ------------------------------------------------------------------
-builder.Services.AddSingleton<OracleDbContext>();
+// -- Database -----------------------------------------------------------------
+builder.Services.AddSingleton<NpgsqlDbContext>();
 
-// -- HTTP clients --------------------------------------------------------------
+// -- HTTP clients -------------------------------------------------------------
 builder.Services.AddHttpClient("Fast2SMS", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(15);
 });
 
-// -- Custom services -----------------------------------------------------------
+// -- Custom services ----------------------------------------------------------
 builder.Services.AddScoped<PasswordService>();
 builder.Services.AddScoped<JwtService>();
 builder.Services.AddScoped<FullSummpotAPI.Services.EmailService>();
@@ -118,7 +113,7 @@ builder.Services.AddScoped<FullSummpotAPI.Services.SmsService>();
 builder.Services.AddScoped<FullSummpotAPI.Services.OtpService>();
 builder.Services.AddScoped<FullSummpotAPI.Services.AuthEventService>();
 
-// -- Firebase Admin SDK --------------------------------------------------------
+// -- Firebase Admin SDK -------------------------------------------------------
 var firebaseCredentialsPath = builder.Configuration["Firebase:CredentialsPath"];
 if (!string.IsNullOrEmpty(firebaseCredentialsPath))
 {
@@ -138,15 +133,15 @@ if (!string.IsNullOrEmpty(firebaseCredentialsPath))
     }
     else
     {
-        Console.WriteLine($"[Firebase Setup Warning]: Service account JSON file not found at {path}. Firebase verification will fail.");
+        Console.WriteLine($"[Firebase] Service account file not found at {path}.");
     }
 }
 else
 {
-    Console.WriteLine("[Firebase Setup Warning]: Firebase:CredentialsPath is not set in configuration. Firebase verification will fail.");
+    Console.WriteLine("[Firebase] CredentialsPath not set — Firebase verification disabled.");
 }
 
-// -- JWT Authentication --------------------------------------------------------
+// -- JWT Authentication -------------------------------------------------------
 var jwtKey = builder.Configuration["Jwt:Key"]
     ?? throw new InvalidOperationException("Jwt:Key is missing in configuration.");
 
@@ -162,7 +157,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidIssuer              = builder.Configuration["Jwt:Issuer"],
             ValidAudience            = builder.Configuration["Jwt:Audience"],
             IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-            ClockSkew                = TimeSpan.Zero   // no grace period on expiry
+            ClockSkew                = TimeSpan.Zero
         };
 
         // Allow SignalR to receive JWT from query string
@@ -181,17 +176,15 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-// -- Build ---------------------------------------------------------------------
+// -- Build --------------------------------------------------------------------
 var app = builder.Build();
 
-// -- Middleware pipeline -------------------------------------------------------
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 
-// Redirect HTTP ? HTTPS in production; skip in dev to avoid cert issues
 if (!app.Environment.IsDevelopment())
     app.UseHttpsRedirection();
 

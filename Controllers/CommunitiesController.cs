@@ -2,7 +2,7 @@ using FullSummpotAPI.Data;
 using FullSummpotAPI.DTOs;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using System.Security.Claims;
 
 namespace FullSummpotAPI.Controllers
@@ -12,18 +12,13 @@ namespace FullSummpotAPI.Controllers
     [Authorize]
     public class CommunitiesController : ControllerBase
     {
-        private readonly OracleDbContext _db;
-
+        private readonly NpgsqlDbContext _db;
         private static readonly HashSet<string> AllowedNiches = new(StringComparer.OrdinalIgnoreCase)
-        {
-            "Gaming","Tech","Education","Music","Comedy","Vlogging",
-            "Finance","Fitness","Food","Travel","Other"
-        };
-
+        { "Gaming","Tech","Education","Music","Comedy","Vlogging","Finance","Fitness","Food","Travel","Other" };
         private static readonly string[] AllowedImageTypes = { "image/jpeg", "image/png", "image/webp" };
         private static readonly string[] AllowedImageExts  = { ".jpg", ".jpeg", ".png", ".webp" };
 
-        public CommunitiesController(OracleDbContext db) => _db = db;
+        public CommunitiesController(NpgsqlDbContext db) => _db = db;
 
         private bool TryGetUserId(out int userId)
         {
@@ -36,44 +31,39 @@ namespace FullSummpotAPI.Controllers
         public IActionResult GetAll()
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.BindByName = true;
-            cmd.CommandText = @"
-                SELECT c.COMMUNITY_ID, c.NAME, c.DESCRIPTION, c.NICHE, c.CREATED_BY,
-                       c.BANNER_URL,
-                       u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
-                       COUNT(cm.USER_ID) AS MEMBER_COUNT,
-                       CASE WHEN SUM(CASE WHEN cm.USER_ID = :userIdParam THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS IS_MEMBER,
-                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR,
-                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
-                FROM COMMUNITIES c
-                LEFT JOIN COMMUNITY_MEMBERS cm ON cm.COMMUNITY_ID = c.COMMUNITY_ID
-                LEFT JOIN USERS u ON u.USER_ID = c.CREATED_BY
-                GROUP BY c.COMMUNITY_ID, c.NAME, c.DESCRIPTION, c.NICHE, c.CREATED_BY,
-                         c.BANNER_URL, u.USERNAME, u.AVATAR_URL";
-            cmd.Parameters.Add("userIdParam", OracleDbType.Int32).Value = userId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT c.community_id, c.name, c.description, c.niche, c.created_by, c.banner_url,
+                       u.username AS creator_name, u.avatar_url AS creator_avatar,
+                       COUNT(cm.user_id) AS member_count,
+                       CASE WHEN SUM(CASE WHEN cm.user_id = @uid THEN 1 ELSE 0 END) > 0 THEN TRUE ELSE FALSE END AS is_member,
+                       CASE WHEN c.created_by = @uid THEN TRUE ELSE FALSE END AS is_creator,
+                       (SELECT url FROM links WHERE community_id = c.community_id ORDER BY created_at DESC LIMIT 1) AS latest_link_url
+                FROM communities c
+                LEFT JOIN community_members cm ON cm.community_id = c.community_id
+                LEFT JOIN users u ON u.user_id = c.created_by
+                GROUP BY c.community_id, c.name, c.description, c.niche, c.created_by,
+                         c.banner_url, u.username, u.avatar_url", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
             using var reader = cmd.ExecuteReader();
             var communities = new List<object>();
             while (reader.Read())
             {
                 communities.Add(new
                 {
-                    communityId  = reader.GetInt32(reader.GetOrdinal("COMMUNITY_ID")),
-                    name         = reader["NAME"]?.ToString(),
-                    description  = reader["DESCRIPTION"]?.ToString(),
-                    niche        = reader["NICHE"]?.ToString(),
-                    bannerUrl    = reader["BANNER_URL"] == DBNull.Value ? null : reader["BANNER_URL"].ToString(),
-                    memberCount  = reader.GetInt32(reader.GetOrdinal("MEMBER_COUNT")),
-                    isMember     = reader.GetInt32(reader.GetOrdinal("IS_MEMBER")) == 1,
-                    isCreator    = reader.GetInt32(reader.GetOrdinal("IS_CREATOR")) == 1,
-                    creatorId    = reader.GetInt32(reader.GetOrdinal("CREATED_BY")),
-                    creatorName  = reader["CREATOR_NAME"]?.ToString(),
-                    creatorAvatar= reader["CREATOR_AVATAR"]?.ToString(),
-                    latestLinkUrl= reader["LATEST_LINK_URL"] == DBNull.Value ? null : reader["LATEST_LINK_URL"].ToString()
+                    communityId   = reader.GetInt32(reader.GetOrdinal("community_id")),
+                    name          = reader["name"]?.ToString(),
+                    description   = reader["description"]?.ToString(),
+                    niche         = reader["niche"]?.ToString(),
+                    bannerUrl     = reader["banner_url"] == DBNull.Value ? null : reader["banner_url"].ToString(),
+                    memberCount   = Convert.ToInt32(reader["member_count"]),
+                    isMember      = Convert.ToBoolean(reader["is_member"]),
+                    isCreator     = Convert.ToBoolean(reader["is_creator"]),
+                    creatorId     = reader.GetInt32(reader.GetOrdinal("created_by")),
+                    creatorName   = reader["creator_name"]?.ToString(),
+                    creatorAvatar = reader["creator_avatar"]?.ToString(),
+                    latestLinkUrl = reader["latest_link_url"] == DBNull.Value ? null : reader["latest_link_url"].ToString()
                 });
             }
             return Ok(communities);
@@ -83,45 +73,39 @@ namespace FullSummpotAPI.Controllers
         public IActionResult GetById(int id)
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.BindByName = true;
-            cmd.CommandText = @"
-                SELECT c.COMMUNITY_ID, c.NAME, c.DESCRIPTION, c.NICHE, c.CREATED_BY,
-                       c.BANNER_URL,
-                       u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
-                       COUNT(cm.USER_ID) AS MEMBER_COUNT,
-                       CASE WHEN SUM(CASE WHEN cm.USER_ID = :userIdParam THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS IS_MEMBER,
-                       CASE WHEN c.CREATED_BY = :userIdParam THEN 1 ELSE 0 END AS IS_CREATOR,
-                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
-                FROM COMMUNITIES c
-                LEFT JOIN COMMUNITY_MEMBERS cm ON cm.COMMUNITY_ID = c.COMMUNITY_ID
-                LEFT JOIN USERS u ON u.USER_ID = c.CREATED_BY
-                WHERE c.COMMUNITY_ID = :communityIdParam
-                GROUP BY c.COMMUNITY_ID, c.NAME, c.DESCRIPTION, c.NICHE, c.CREATED_BY,
-                         c.BANNER_URL, u.USERNAME, u.AVATAR_URL";
-            cmd.Parameters.Add("userIdParam", OracleDbType.Int32).Value = userId;
-            cmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value = id;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT c.community_id, c.name, c.description, c.niche, c.created_by, c.banner_url,
+                       u.username AS creator_name, u.avatar_url AS creator_avatar,
+                       COUNT(cm.user_id) AS member_count,
+                       CASE WHEN SUM(CASE WHEN cm.user_id = @uid THEN 1 ELSE 0 END) > 0 THEN TRUE ELSE FALSE END AS is_member,
+                       CASE WHEN c.created_by = @uid THEN TRUE ELSE FALSE END AS is_creator,
+                       (SELECT url FROM links WHERE community_id = c.community_id ORDER BY created_at DESC LIMIT 1) AS latest_link_url
+                FROM communities c
+                LEFT JOIN community_members cm ON cm.community_id = c.community_id
+                LEFT JOIN users u ON u.user_id = c.created_by
+                WHERE c.community_id = @cid
+                GROUP BY c.community_id, c.name, c.description, c.niche, c.created_by,
+                         c.banner_url, u.username, u.avatar_url", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
+            cmd.Parameters.AddWithValue("cid", id);
             using var reader = cmd.ExecuteReader();
             if (!reader.Read()) return NotFound(new { message = "Community not found." });
-
             return Ok(new
             {
-                communityId  = reader.GetInt32(reader.GetOrdinal("COMMUNITY_ID")),
-                name         = reader["NAME"]?.ToString(),
-                description  = reader["DESCRIPTION"]?.ToString(),
-                niche        = reader["NICHE"]?.ToString(),
-                bannerUrl    = reader["BANNER_URL"] == DBNull.Value ? null : reader["BANNER_URL"].ToString(),
-                memberCount  = reader.GetInt32(reader.GetOrdinal("MEMBER_COUNT")),
-                isMember     = reader.GetInt32(reader.GetOrdinal("IS_MEMBER")) == 1,
-                isCreator    = reader.GetInt32(reader.GetOrdinal("IS_CREATOR")) == 1,
-                creatorId    = reader.GetInt32(reader.GetOrdinal("CREATED_BY")),
-                creatorName  = reader["CREATOR_NAME"]?.ToString(),
-                creatorAvatar= reader["CREATOR_AVATAR"]?.ToString(),
-                latestLinkUrl= reader["LATEST_LINK_URL"] == DBNull.Value ? null : reader["LATEST_LINK_URL"].ToString()
+                communityId   = reader.GetInt32(reader.GetOrdinal("community_id")),
+                name          = reader["name"]?.ToString(),
+                description   = reader["description"]?.ToString(),
+                niche         = reader["niche"]?.ToString(),
+                bannerUrl     = reader["banner_url"] == DBNull.Value ? null : reader["banner_url"].ToString(),
+                memberCount   = Convert.ToInt32(reader["member_count"]),
+                isMember      = Convert.ToBoolean(reader["is_member"]),
+                isCreator     = Convert.ToBoolean(reader["is_creator"]),
+                creatorId     = reader.GetInt32(reader.GetOrdinal("created_by")),
+                creatorName   = reader["creator_name"]?.ToString(),
+                creatorAvatar = reader["creator_avatar"]?.ToString(),
+                latestLinkUrl = reader["latest_link_url"] == DBNull.Value ? null : reader["latest_link_url"].ToString()
             });
         }
 
@@ -130,52 +114,35 @@ namespace FullSummpotAPI.Controllers
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
             if (!ModelState.IsValid) return BadRequest(ModelState);
-
             if (!AllowedNiches.Contains(dto.Niche))
                 return BadRequest(new { message = "Invalid niche selected." });
 
             using var conn = _db.GetConnection();
             conn.Open();
-            using var transaction = conn.BeginTransaction();
+            using var tx = conn.BeginTransaction();
             try
             {
-                using var insertCmd = conn.CreateCommand();
-                insertCmd.BindByName = true;
-                insertCmd.Transaction = transaction;
-                insertCmd.CommandText = @"
-                    INSERT INTO COMMUNITIES (NAME, DESCRIPTION, NICHE, CREATED_BY)
-                    VALUES (:nameParam, :descParam, :nicheParam, :createdByParam)";
-                insertCmd.Parameters.Add("nameParam",      OracleDbType.Varchar2).Value = dto.Name;
-                insertCmd.Parameters.Add("descParam",      OracleDbType.Varchar2).Value = dto.Description;
-                insertCmd.Parameters.Add("nicheParam",     OracleDbType.Varchar2).Value = dto.Niche;
-                insertCmd.Parameters.Add("createdByParam", OracleDbType.Int32).Value    = userId;
-                insertCmd.ExecuteNonQuery();
+                using var insertCmd = new NpgsqlCommand(@"
+                    INSERT INTO communities (name, description, niche, created_by)
+                    VALUES (@name, @desc, @niche, @createdBy)
+                    RETURNING community_id", conn, tx);
+                insertCmd.Parameters.AddWithValue("name",      dto.Name);
+                insertCmd.Parameters.AddWithValue("desc",      dto.Description);
+                insertCmd.Parameters.AddWithValue("niche",     dto.Niche);
+                insertCmd.Parameters.AddWithValue("createdBy", userId);
+                var newId = Convert.ToInt32(insertCmd.ExecuteScalar());
 
-                using var getIdCmd = conn.CreateCommand();
-                getIdCmd.Transaction = transaction;
-                getIdCmd.CommandText = "SELECT MAX(COMMUNITY_ID) FROM COMMUNITIES";
-                var newCommunityId = Convert.ToInt32(getIdCmd.ExecuteScalar());
-
-                using var joinCmd = conn.CreateCommand();
-                joinCmd.BindByName = true;
-                joinCmd.Transaction = transaction;
-                joinCmd.CommandText = @"
-                    INSERT INTO COMMUNITY_MEMBERS (USER_ID, COMMUNITY_ID)
-                    VALUES (:userIdParam, :communityIdParam)";
-                joinCmd.Parameters.Add("userIdParam",      OracleDbType.Int32).Value = userId;
-                joinCmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value = newCommunityId;
+                using var joinCmd = new NpgsqlCommand(@"
+                    INSERT INTO community_members (user_id, community_id) VALUES (@uid, @cid)", conn, tx);
+                joinCmd.Parameters.AddWithValue("uid", userId);
+                joinCmd.Parameters.AddWithValue("cid", newId);
                 joinCmd.ExecuteNonQuery();
 
-                transaction.Commit();
-                return CreatedAtAction(nameof(GetById),
-                    new { id = newCommunityId },
-                    new { message = "Community created successfully", communityId = newCommunityId });
+                tx.Commit();
+                return CreatedAtAction(nameof(GetById), new { id = newId },
+                    new { message = "Community created successfully", communityId = newId });
             }
-            catch (Exception)
-            {
-                transaction.Rollback();
-                return StatusCode(500, new { error = "Failed to create community." });
-            }
+            catch (Exception) { tx.Rollback(); return StatusCode(500, new { error = "Failed to create community." }); }
         }
 
         [HttpPut("{id:int}")]
@@ -183,38 +150,29 @@ namespace FullSummpotAPI.Controllers
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
             if (!ModelState.IsValid) return BadRequest(ModelState);
-
             if (!AllowedNiches.Contains(dto.Niche))
                 return BadRequest(new { message = "Invalid niche selected." });
 
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var check = new OracleCommand(
-                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
-            check.BindByName = true;
-            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
-            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
-            if (Convert.ToInt32(check.ExecuteScalar()) == 0)
-                return StatusCode(403, new { message = "Only the creator can edit this community." });
-
-            try
+            using (var check = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM communities WHERE community_id = @cid AND created_by = @uid", conn))
             {
-                var cmd = new OracleCommand(@"
-                    UPDATE COMMUNITIES SET NAME = :nameParam, DESCRIPTION = :descParam, NICHE = :nicheParam
-                    WHERE COMMUNITY_ID = :communityIdParam", conn);
-                cmd.BindByName = true;
-                cmd.Parameters.Add("nameParam",        OracleDbType.Varchar2, 100).Value  = dto.Name;
-                cmd.Parameters.Add("descParam",        OracleDbType.Varchar2, 500).Value  = dto.Description;
-                cmd.Parameters.Add("nicheParam",       OracleDbType.Varchar2, 100).Value  = dto.Niche;
-                cmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value          = id;
-                cmd.ExecuteNonQuery();
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, new { message = "Failed to update community.", detail = ex.Message });
+                check.Parameters.AddWithValue("cid", id);
+                check.Parameters.AddWithValue("uid", userId);
+                if (Convert.ToInt32(check.ExecuteScalar()) == 0)
+                    return StatusCode(403, new { message = "Only the creator can edit this community." });
             }
 
+            using var cmd = new NpgsqlCommand(@"
+                UPDATE communities SET name = @name, description = @desc, niche = @niche
+                WHERE community_id = @cid", conn);
+            cmd.Parameters.AddWithValue("name", dto.Name);
+            cmd.Parameters.AddWithValue("desc", dto.Description);
+            cmd.Parameters.AddWithValue("niche", dto.Niche);
+            cmd.Parameters.AddWithValue("cid", id);
+            cmd.ExecuteNonQuery();
             return Ok(new { message = "Community updated successfully" });
         }
 
@@ -222,25 +180,16 @@ namespace FullSummpotAPI.Controllers
         public IActionResult Join(int id)
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.BindByName = true;
-            cmd.CommandText = @"
-                INSERT INTO COMMUNITY_MEMBERS (USER_ID, COMMUNITY_ID)
-                SELECT :userIdParam, :communityIdParam FROM DUAL
-                WHERE EXISTS (SELECT 1 FROM COMMUNITIES WHERE COMMUNITY_ID = :communityIdParam)
-                  AND NOT EXISTS (
-                    SELECT 1 FROM COMMUNITY_MEMBERS
-                    WHERE USER_ID = :userIdParam AND COMMUNITY_ID = :communityIdParam
-                  )";
-            cmd.Parameters.Add("userIdParam",      OracleDbType.Int32).Value = userId;
-            cmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value = id;
-
+            using var cmd = new NpgsqlCommand(@"
+                INSERT INTO community_members (user_id, community_id)
+                SELECT @uid, @cid WHERE EXISTS (SELECT 1 FROM communities WHERE community_id = @cid)
+                  AND NOT EXISTS (SELECT 1 FROM community_members WHERE user_id = @uid AND community_id = @cid)", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
+            cmd.Parameters.AddWithValue("cid", id);
             if (cmd.ExecuteNonQuery() == 0)
                 return BadRequest(new { message = "Community not found or already joined." });
-
             return Ok(new { message = "Joined successfully" });
         }
 
@@ -248,30 +197,23 @@ namespace FullSummpotAPI.Controllers
         public IActionResult Leave(int id)
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
-
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var checkCmd = conn.CreateCommand();
-            checkCmd.BindByName = true;
-            checkCmd.CommandText = "SELECT CREATED_BY FROM COMMUNITIES WHERE COMMUNITY_ID = :communityIdParam";
-            checkCmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value = id;
-            var createdBy = checkCmd.ExecuteScalar();
+            using (var checkCmd = new NpgsqlCommand(
+                "SELECT created_by FROM communities WHERE community_id = @cid", conn))
+            {
+                checkCmd.Parameters.AddWithValue("cid", id);
+                var createdBy = checkCmd.ExecuteScalar();
+                if (createdBy != null && Convert.ToInt32(createdBy) == userId)
+                    return BadRequest(new { message = "Community creator cannot leave. Delete the community instead." });
+            }
 
-            if (createdBy != null && Convert.ToInt32(createdBy) == userId)
-                return BadRequest(new { message = "Community creator cannot leave. Delete the community instead." });
-
-            var cmd = conn.CreateCommand();
-            cmd.BindByName = true;
-            cmd.CommandText = @"
-                DELETE FROM COMMUNITY_MEMBERS
-                WHERE USER_ID = :userIdParam AND COMMUNITY_ID = :communityIdParam";
-            cmd.Parameters.Add("userIdParam",      OracleDbType.Int32).Value = userId;
-            cmd.Parameters.Add("communityIdParam", OracleDbType.Int32).Value = id;
-
-            if (cmd.ExecuteNonQuery() == 0)
-                return NotFound(new { message = "Membership not found." });
-
+            using var cmd = new NpgsqlCommand(
+                "DELETE FROM community_members WHERE user_id = @uid AND community_id = @cid", conn);
+            cmd.Parameters.AddWithValue("uid", userId);
+            cmd.Parameters.AddWithValue("cid", id);
+            if (cmd.ExecuteNonQuery() == 0) return NotFound(new { message = "Membership not found." });
             return Ok(new { message = "Left successfully" });
         }
 
@@ -279,95 +221,121 @@ namespace FullSummpotAPI.Controllers
         public async Task<IActionResult> UploadBanner(int id, IFormFile file)
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
-
-            if (file == null || file.Length == 0)
-                return BadRequest(new { message = "No file uploaded." });
-
-            if (file.Length > 5 * 1024 * 1024)
-                return BadRequest(new { message = "Banner must be under 5 MB." });
-
-            if (!AllowedImageTypes.Contains(file.ContentType.ToLower()))
-                return BadRequest(new { message = "Only JPEG, PNG and WebP images are allowed." });
-
+            if (file == null || file.Length == 0) return BadRequest(new { message = "No file uploaded." });
+            if (file.Length > 5 * 1024 * 1024) return BadRequest(new { message = "Banner must be under 5 MB." });
+            if (!AllowedImageTypes.Contains(file.ContentType.ToLower())) return BadRequest(new { message = "Only JPEG, PNG and WebP images are allowed." });
             var ext = Path.GetExtension(file.FileName).ToLower();
-            if (!AllowedImageExts.Contains(ext))
-                return BadRequest(new { message = "Invalid file extension." });
+            if (!AllowedImageExts.Contains(ext)) return BadRequest(new { message = "Invalid file extension." });
 
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var check = new OracleCommand(
-                "SELECT COUNT(*) FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
-            check.BindByName = true;
-            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
-            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
-            if (Convert.ToInt32(check.ExecuteScalar()) == 0)
-                return StatusCode(403, new { message = "Only the community creator can upload a banner." });
-
-            // Delete old banner
-            var oldCmd = new OracleCommand("SELECT BANNER_URL FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId", conn);
-            oldCmd.BindByName = true;
-            oldCmd.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
-            var oldUrl = oldCmd.ExecuteScalar()?.ToString();
-            if (!string.IsNullOrEmpty(oldUrl))
+            using (var check = new NpgsqlCommand("SELECT COUNT(*) FROM communities WHERE community_id = @cid AND created_by = @uid", conn))
             {
-                var oldPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", oldUrl.TrimStart('/'));
-                if (System.IO.File.Exists(oldPath)) System.IO.File.Delete(oldPath);
+                check.Parameters.AddWithValue("cid", id);
+                check.Parameters.AddWithValue("uid", userId);
+                if (Convert.ToInt32(check.ExecuteScalar()) == 0)
+                    return StatusCode(403, new { message = "Only the community creator can upload a banner." });
+            }
+
+            using (var oldCmd = new NpgsqlCommand("SELECT banner_url FROM communities WHERE community_id = @cid", conn))
+            {
+                oldCmd.Parameters.AddWithValue("cid", id);
+                var oldUrl = oldCmd.ExecuteScalar()?.ToString();
+                if (!string.IsNullOrEmpty(oldUrl))
+                {
+                    var oldPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", oldUrl.TrimStart('/'));
+                    if (System.IO.File.Exists(oldPath)) System.IO.File.Delete(oldPath);
+                }
             }
 
             var uploadsPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", "banners");
             Directory.CreateDirectory(uploadsPath);
-
             var safeFileName = $"banner_{id}_{DateTime.UtcNow.Ticks}{ext}";
             var filePath = Path.Combine(uploadsPath, safeFileName);
-
             using (var stream = new FileStream(filePath, FileMode.Create))
                 await file.CopyToAsync(stream);
-
             var publicUrl = $"/uploads/banners/{safeFileName}";
 
-            var cmd = new OracleCommand(
-                "UPDATE COMMUNITIES SET BANNER_URL = :url WHERE COMMUNITY_ID = :communityId", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("url",         OracleDbType.Varchar2).Value = publicUrl;
-            cmd.Parameters.Add("communityId", OracleDbType.Int32).Value    = id;
+            using var cmd = new NpgsqlCommand("UPDATE communities SET banner_url = @url WHERE community_id = @cid", conn);
+            cmd.Parameters.AddWithValue("url", publicUrl);
+            cmd.Parameters.AddWithValue("cid", id);
             cmd.ExecuteNonQuery();
-
             return Ok(new { bannerUrl = publicUrl });
         }
 
-        [HttpDelete("{id:int}/banner")]
-        public IActionResult RemoveBanner(int id)
+        [HttpDelete("{id:int}")]
+        public IActionResult Delete(int id)
         {
             if (!TryGetUserId(out var userId)) return Unauthorized();
 
             using var conn = _db.GetConnection();
             conn.Open();
 
-            // Only the community creator can remove the banner
-            var check = new OracleCommand(
-                "SELECT BANNER_URL FROM COMMUNITIES WHERE COMMUNITY_ID = :communityId AND CREATED_BY = :userId", conn);
-            check.BindByName = true;
-            check.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
-            check.Parameters.Add("userId",      OracleDbType.Int32).Value = userId;
-            var oldUrl = check.ExecuteScalar()?.ToString();
-            if (oldUrl == null)
-                return StatusCode(403, new { message = "Community not found or you are not the creator." });
+            // Only the creator can delete their own community
+            using (var check = new NpgsqlCommand(
+                "SELECT COUNT(*) FROM communities WHERE community_id = @cid AND created_by = @uid", conn))
+            {
+                check.Parameters.AddWithValue("cid", id);
+                check.Parameters.AddWithValue("uid", userId);
+                if (Convert.ToInt32(check.ExecuteScalar()) == 0)
+                    return StatusCode(403, new { message = "Only the community creator can delete this community." });
+            }
 
-            // Delete the physical file if it exists
+            using var tx = conn.BeginTransaction();
+            try
+            {
+                // Delete all links and their dependents first
+                var linkIds = new List<int>();
+                using (var linkCmd = new NpgsqlCommand("SELECT link_id FROM links WHERE community_id = @cid", conn, tx))
+                {
+                    linkCmd.Parameters.AddWithValue("cid", id);
+                    using var lr = linkCmd.ExecuteReader();
+                    while (lr.Read()) linkIds.Add(Convert.ToInt32(lr["link_id"]));
+                }
+                foreach (var lid in linkIds)
+                {
+                    void ExecLink(string sql) { using var c = new NpgsqlCommand(sql, conn, tx); c.Parameters.AddWithValue("lid", lid); c.ExecuteNonQuery(); }
+                    ExecLink("DELETE FROM link_comments WHERE link_id = @lid");
+                    ExecLink("DELETE FROM link_likes    WHERE link_id = @lid");
+                    ExecLink("DELETE FROM link_clicks   WHERE link_id = @lid");
+                    ExecLink("DELETE FROM links         WHERE link_id = @lid");
+                }
+
+                using (var dm = new NpgsqlCommand("DELETE FROM community_members WHERE community_id = @cid", conn, tx))
+                { dm.Parameters.AddWithValue("cid", id); dm.ExecuteNonQuery(); }
+
+                using (var dc = new NpgsqlCommand("DELETE FROM communities WHERE community_id = @cid", conn, tx))
+                { dc.Parameters.AddWithValue("cid", id); dc.ExecuteNonQuery(); }
+
+                tx.Commit();
+                return Ok(new { message = "Community deleted successfully" });
+            }
+            catch { tx.Rollback(); return StatusCode(500, new { message = "Failed to delete community." }); }
+        }
+
+        [HttpDelete("{id:int}/banner")]
+        public IActionResult RemoveBanner(int id)        {
+            if (!TryGetUserId(out var userId)) return Unauthorized();
+            using var conn = _db.GetConnection();
+            conn.Open();
+
+            using var check = new NpgsqlCommand(
+                "SELECT banner_url FROM communities WHERE community_id = @cid AND created_by = @uid", conn);
+            check.Parameters.AddWithValue("cid", id);
+            check.Parameters.AddWithValue("uid", userId);
+            var oldUrl = check.ExecuteScalar()?.ToString();
+            if (oldUrl == null) return StatusCode(403, new { message = "Community not found or you are not the creator." });
+
             if (!string.IsNullOrEmpty(oldUrl))
             {
                 var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", oldUrl.TrimStart('/'));
                 if (System.IO.File.Exists(filePath)) System.IO.File.Delete(filePath);
             }
 
-            // Clear the banner_url in DB
-            var cmd = new OracleCommand(
-                "UPDATE COMMUNITIES SET BANNER_URL = NULL WHERE COMMUNITY_ID = :communityId", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("communityId", OracleDbType.Int32).Value = id;
+            using var cmd = new NpgsqlCommand("UPDATE communities SET banner_url = NULL WHERE community_id = @cid", conn);
+            cmd.Parameters.AddWithValue("cid", id);
             cmd.ExecuteNonQuery();
-
             return Ok(new { message = "Banner removed" });
         }
     }

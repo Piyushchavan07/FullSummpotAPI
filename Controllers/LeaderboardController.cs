@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using FullSummpotAPI.Data;
 
 namespace FullSummpotAPI.Controllers
@@ -10,27 +10,24 @@ namespace FullSummpotAPI.Controllers
     [Authorize]
     public class LeaderboardController : ControllerBase
     {
-        private readonly OracleDbContext _db;
-
-        public LeaderboardController(OracleDbContext db) => _db = db;
+        private readonly NpgsqlDbContext _db;
+        public LeaderboardController(NpgsqlDbContext db) => _db = db;
 
         [HttpGet]
         public IActionResult GetLeaderboard()
         {
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT u.USER_ID, u.USERNAME, u.CONTENT_NICHE,
-                       u.AVAILABLE_POINTS, u.AVATAR_URL,
-                       COUNT(l.LINK_ID)          AS LINKS_SUBMITTED,
-                       NVL(SUM(l.CLICKS), 0)     AS TOTAL_CLICKS
-                FROM USERS u
-                LEFT JOIN LINKS l ON u.USER_ID = l.USER_ID
-                GROUP BY u.USER_ID, u.USERNAME, u.CONTENT_NICHE,
-                         u.AVAILABLE_POINTS, u.AVATAR_URL
-                ORDER BY u.AVAILABLE_POINTS DESC
-                FETCH FIRST 100 ROWS ONLY", conn);
+            using var cmd = new NpgsqlCommand(@"
+                SELECT u.user_id, u.username, u.content_niche,
+                       u.available_points, u.avatar_url,
+                       COUNT(l.link_id)           AS links_submitted,
+                       COALESCE(SUM(l.clicks), 0) AS total_clicks
+                FROM users u
+                LEFT JOIN links l ON u.user_id = l.user_id
+                GROUP BY u.user_id, u.username, u.content_niche, u.available_points, u.avatar_url
+                ORDER BY u.available_points DESC
+                LIMIT 100", conn);
 
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
@@ -40,13 +37,13 @@ namespace FullSummpotAPI.Controllers
                 list.Add(new
                 {
                     rank           = rank++,
-                    userId         = Convert.ToInt32(reader["USER_ID"]),
-                    username       = reader["USERNAME"]?.ToString(),
-                    niche          = reader["CONTENT_NICHE"]?.ToString(),
-                    points         = Convert.ToInt32(reader["AVAILABLE_POINTS"]),
-                    avatarUrl      = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                    linksSubmitted = Convert.ToInt32(reader["LINKS_SUBMITTED"]),
-                    clicksReceived = Convert.ToInt32(reader["TOTAL_CLICKS"])
+                    userId         = Convert.ToInt32(reader["user_id"]),
+                    username       = reader["username"]?.ToString(),
+                    niche          = reader["content_niche"]?.ToString(),
+                    points         = Convert.ToInt32(reader["available_points"]),
+                    avatarUrl      = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(),
+                    linksSubmitted = Convert.ToInt32(reader["links_submitted"]),
+                    clicksReceived = Convert.ToInt32(reader["total_clicks"])
                 });
             }
             return Ok(list);

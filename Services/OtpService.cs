@@ -1,177 +1,163 @@
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using System.Security.Cryptography;
 
 namespace FullSummpotAPI.Services
 {
     public class OtpService
     {
-        public const int ExpiryMinutes = 15;
-        public const int ResendCooldownSeconds = 60;
-        public const int MaxWrongAttempts = 5;
+        public const int ExpiryMinutes          = 15;
+        public const int ResendCooldownSeconds  = 60;
+        public const int MaxWrongAttempts       = 5;
 
         public static string Generate() =>
             (BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(4), 0) % 1_000_000).ToString("D6");
 
-        public int GetResendCooldownSeconds(OracleConnection conn, string channel, string contact, string purpose)
+        public int GetResendCooldownSeconds(NpgsqlConnection conn, string channel, string contact, string purpose)
         {
             var sql = channel == "email"
-                ? @"SELECT GREATEST(0, :cooldown - EXTRACT(SECOND FROM (SYS_EXTRACT_UTC(SYSTIMESTAMP) - MAX(CREATED_AT)))
-                    - EXTRACT(MINUTE FROM (SYS_EXTRACT_UTC(SYSTIMESTAMP) - MAX(CREATED_AT))) * 60)
-                    FROM EMAIL_OTPS
-                    WHERE LOWER(EMAIL) = :contact AND PURPOSE = :purpose
-                      AND CREATED_AT > SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '1' HOUR"
-                : @"SELECT GREATEST(0, :cooldown - EXTRACT(SECOND FROM (SYS_EXTRACT_UTC(SYSTIMESTAMP) - MAX(CREATED_AT)))
-                    - EXTRACT(MINUTE FROM (SYS_EXTRACT_UTC(SYSTIMESTAMP) - MAX(CREATED_AT))) * 60)
-                    FROM PHONE_OTPS
-                    WHERE PHONE_NUMBER = :contact AND PURPOSE = :purpose
-                      AND CREATED_AT > SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '1' HOUR";
+                ? @"SELECT GREATEST(0, @cooldown - EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'UTC' - MAX(created_at))))
+                    FROM email_otps
+                    WHERE LOWER(email) = @contact AND purpose = @purpose
+                      AND created_at > NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour'"
+                : @"SELECT GREATEST(0, @cooldown - EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'UTC' - MAX(created_at))))
+                    FROM phone_otps
+                    WHERE phone_number = @contact AND purpose = @purpose
+                      AND created_at > NOW() AT TIME ZONE 'UTC' - INTERVAL '1 hour'";
 
-            var cmd = new OracleCommand(sql, conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("cooldown", OracleDbType.Int32).Value = ResendCooldownSeconds;
-            cmd.Parameters.Add("contact", OracleDbType.Varchar2).Value =
-                channel == "email" ? contact.ToLower() : contact;
-            cmd.Parameters.Add("purpose", OracleDbType.Varchar2).Value = purpose;
+            using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("cooldown", ResendCooldownSeconds);
+            cmd.Parameters.AddWithValue("contact", channel == "email" ? contact.ToLower() : contact);
+            cmd.Parameters.AddWithValue("purpose", purpose);
 
             var result = cmd.ExecuteScalar();
             if (result == null || result == DBNull.Value) return 0;
             return Math.Max(0, Convert.ToInt32(Math.Floor(Convert.ToDecimal(result))));
         }
 
-        public async Task StoreEmailOtpAsync(OracleConnection conn, string email, string otp, string purpose)
+        public async Task StoreEmailOtpAsync(NpgsqlConnection conn, string email, string otp, string purpose)
         {
-            var expireCmd = new OracleCommand(@"
-                UPDATE EMAIL_OTPS SET USED = 1
-                WHERE LOWER(EMAIL) = :email AND PURPOSE = :purpose AND USED = 0", conn);
-            expireCmd.BindByName = true;
-            expireCmd.Parameters.Add("email", email.ToLower());
-            expireCmd.Parameters.Add("purpose", purpose);
+            using var expireCmd = new NpgsqlCommand(@"
+                UPDATE email_otps SET used = TRUE
+                WHERE LOWER(email) = @email AND purpose = @purpose AND used = FALSE", conn);
+            expireCmd.Parameters.AddWithValue("email", email.ToLower());
+            expireCmd.Parameters.AddWithValue("purpose", purpose);
             await expireCmd.ExecuteNonQueryAsync();
 
-            var insertCmd = new OracleCommand($@"
-                INSERT INTO EMAIL_OTPS (EMAIL, OTP_CODE, PURPOSE, EXPIRES_AT, WRONG_ATTEMPTS, CREATED_AT)
-                VALUES (:email, :otp, :purpose,
-                        SYS_EXTRACT_UTC(SYSTIMESTAMP) + INTERVAL '{ExpiryMinutes}' MINUTE, 0,
-                        SYS_EXTRACT_UTC(SYSTIMESTAMP))", conn);
-            insertCmd.BindByName = true;
-            insertCmd.Parameters.Add("email", email.ToLower());
-            insertCmd.Parameters.Add("otp", otp);
-            insertCmd.Parameters.Add("purpose", purpose);
+            using var insertCmd = new NpgsqlCommand($@"
+                INSERT INTO email_otps (email, otp_code, purpose, expires_at, wrong_attempts, created_at)
+                VALUES (@email, @otp, @purpose,
+                        NOW() AT TIME ZONE 'UTC' + INTERVAL '{ExpiryMinutes} minutes',
+                        0, NOW() AT TIME ZONE 'UTC')", conn);
+            insertCmd.Parameters.AddWithValue("email", email.ToLower());
+            insertCmd.Parameters.AddWithValue("otp", otp);
+            insertCmd.Parameters.AddWithValue("purpose", purpose);
             await insertCmd.ExecuteNonQueryAsync();
         }
 
-        public async Task StorePhoneOtpAsync(OracleConnection conn, string phone, string otp, string purpose)
+        public async Task StorePhoneOtpAsync(NpgsqlConnection conn, string phone, string otp, string purpose)
         {
-            var expireCmd = new OracleCommand(@"
-                UPDATE PHONE_OTPS SET USED = 1
-                WHERE PHONE_NUMBER = :phone AND PURPOSE = :purpose AND USED = 0", conn);
-            expireCmd.BindByName = true;
-            expireCmd.Parameters.Add("phone", phone);
-            expireCmd.Parameters.Add("purpose", purpose);
+            using var expireCmd = new NpgsqlCommand(@"
+                UPDATE phone_otps SET used = TRUE
+                WHERE phone_number = @phone AND purpose = @purpose AND used = FALSE", conn);
+            expireCmd.Parameters.AddWithValue("phone", phone);
+            expireCmd.Parameters.AddWithValue("purpose", purpose);
             await expireCmd.ExecuteNonQueryAsync();
 
-            var insertCmd = new OracleCommand($@"
-                INSERT INTO PHONE_OTPS (PHONE_NUMBER, OTP_CODE, PURPOSE, EXPIRES_AT, WRONG_ATTEMPTS, CREATED_AT)
-                VALUES (:phone, :otp, :purpose,
-                        SYS_EXTRACT_UTC(SYSTIMESTAMP) + INTERVAL '{ExpiryMinutes}' MINUTE, 0,
-                        SYS_EXTRACT_UTC(SYSTIMESTAMP))", conn);
-            insertCmd.BindByName = true;
-            insertCmd.Parameters.Add("phone", phone);
-            insertCmd.Parameters.Add("otp", otp);
-            insertCmd.Parameters.Add("purpose", purpose);
+            using var insertCmd = new NpgsqlCommand($@"
+                INSERT INTO phone_otps (phone_number, otp_code, purpose, expires_at, wrong_attempts, created_at)
+                VALUES (@phone, @otp, @purpose,
+                        NOW() AT TIME ZONE 'UTC' + INTERVAL '{ExpiryMinutes} minutes',
+                        0, NOW() AT TIME ZONE 'UTC')", conn);
+            insertCmd.Parameters.AddWithValue("phone", phone);
+            insertCmd.Parameters.AddWithValue("otp", otp);
+            insertCmd.Parameters.AddWithValue("purpose", purpose);
             await insertCmd.ExecuteNonQueryAsync();
         }
 
-        public bool ValidateEmailOtp(OracleConnection conn, string email, string otp, string purpose)
+        public bool ValidateEmailOtp(NpgsqlConnection conn, string email, string otp, string purpose)
         {
-            var findCmd = new OracleCommand(@"
-                SELECT OTP_ID, WRONG_ATTEMPTS FROM EMAIL_OTPS
-                WHERE LOWER(EMAIL) = :email AND PURPOSE = :purpose AND USED = 0
-                  AND EXPIRES_AT > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                ORDER BY CREATED_AT DESC FETCH FIRST 1 ROW ONLY", conn);
-            findCmd.BindByName = true;
-            findCmd.Parameters.Add("email", email.ToLower());
-            findCmd.Parameters.Add("purpose", purpose);
+            using var findCmd = new NpgsqlCommand(@"
+                SELECT otp_id, wrong_attempts FROM email_otps
+                WHERE LOWER(email) = @email AND purpose = @purpose AND used = FALSE
+                  AND expires_at > NOW() AT TIME ZONE 'UTC'
+                ORDER BY created_at DESC LIMIT 1", conn);
+            findCmd.Parameters.AddWithValue("email", email.ToLower());
+            findCmd.Parameters.AddWithValue("purpose", purpose);
 
-            using var reader = findCmd.ExecuteReader();
-            if (!reader.Read()) return false;
+            int otpId, wrong;
+            using (var reader = findCmd.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                otpId = Convert.ToInt32(reader["otp_id"]);
+                wrong = reader["wrong_attempts"] == DBNull.Value ? 0 : Convert.ToInt32(reader["wrong_attempts"]);
+            }
 
-            int otpId = Convert.ToInt32(reader["OTP_ID"]);
-            int wrong = reader["WRONG_ATTEMPTS"] == DBNull.Value ? 0 : Convert.ToInt32(reader["WRONG_ATTEMPTS"]);
-            reader.Close();
-
-            var checkCmd = new OracleCommand(@"
-                SELECT COUNT(*) FROM EMAIL_OTPS
-                WHERE OTP_ID = :id AND OTP_CODE = :otp", conn);
-            checkCmd.BindByName = true;
-            checkCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
-            checkCmd.Parameters.Add("otp", otp);
+            using var checkCmd = new NpgsqlCommand(@"
+                SELECT COUNT(*) FROM email_otps WHERE otp_id = @id AND otp_code = @otp", conn);
+            checkCmd.Parameters.AddWithValue("id", otpId);
+            checkCmd.Parameters.AddWithValue("otp", otp);
 
             if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
             {
                 wrong++;
-                var failCmd = new OracleCommand(@"
-                    UPDATE EMAIL_OTPS SET WRONG_ATTEMPTS = :wrong,
-                           USED = CASE WHEN :wrong >= :max THEN 1 ELSE USED END
-                    WHERE OTP_ID = :id", conn);
-                failCmd.BindByName = true;
-                failCmd.Parameters.Add("wrong", OracleDbType.Int32).Value = wrong;
-                failCmd.Parameters.Add("max", OracleDbType.Int32).Value = MaxWrongAttempts;
-                failCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
+                using var failCmd = new NpgsqlCommand(@"
+                    UPDATE email_otps SET wrong_attempts = @wrong,
+                           used = CASE WHEN @wrong >= @max THEN TRUE ELSE used END
+                    WHERE otp_id = @id", conn);
+                failCmd.Parameters.AddWithValue("wrong", wrong);
+                failCmd.Parameters.AddWithValue("max", MaxWrongAttempts);
+                failCmd.Parameters.AddWithValue("id", otpId);
                 failCmd.ExecuteNonQuery();
                 return false;
             }
 
-            var markCmd = new OracleCommand("UPDATE EMAIL_OTPS SET USED = 1 WHERE OTP_ID = :id", conn);
-            markCmd.BindByName = true;
-            markCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
+            using var markCmd = new NpgsqlCommand(
+                "UPDATE email_otps SET used = TRUE WHERE otp_id = @id", conn);
+            markCmd.Parameters.AddWithValue("id", otpId);
             markCmd.ExecuteNonQuery();
             return true;
         }
 
-        public bool ValidatePhoneOtp(OracleConnection conn, string phone, string otp, string purpose)
+        public bool ValidatePhoneOtp(NpgsqlConnection conn, string phone, string otp, string purpose)
         {
-            var findCmd = new OracleCommand(@"
-                SELECT OTP_ID, WRONG_ATTEMPTS FROM PHONE_OTPS
-                WHERE PHONE_NUMBER = :phone AND PURPOSE = :purpose AND USED = 0
-                  AND EXPIRES_AT > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                ORDER BY CREATED_AT DESC FETCH FIRST 1 ROW ONLY", conn);
-            findCmd.BindByName = true;
-            findCmd.Parameters.Add("phone", phone);
-            findCmd.Parameters.Add("purpose", purpose);
+            using var findCmd = new NpgsqlCommand(@"
+                SELECT otp_id, wrong_attempts FROM phone_otps
+                WHERE phone_number = @phone AND purpose = @purpose AND used = FALSE
+                  AND expires_at > NOW() AT TIME ZONE 'UTC'
+                ORDER BY created_at DESC LIMIT 1", conn);
+            findCmd.Parameters.AddWithValue("phone", phone);
+            findCmd.Parameters.AddWithValue("purpose", purpose);
 
-            using var reader = findCmd.ExecuteReader();
-            if (!reader.Read()) return false;
+            int otpId, wrong;
+            using (var reader = findCmd.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                otpId = Convert.ToInt32(reader["otp_id"]);
+                wrong = reader["wrong_attempts"] == DBNull.Value ? 0 : Convert.ToInt32(reader["wrong_attempts"]);
+            }
 
-            int otpId = Convert.ToInt32(reader["OTP_ID"]);
-            int wrong = reader["WRONG_ATTEMPTS"] == DBNull.Value ? 0 : Convert.ToInt32(reader["WRONG_ATTEMPTS"]);
-            reader.Close();
-
-            var checkCmd = new OracleCommand(@"
-                SELECT COUNT(*) FROM PHONE_OTPS
-                WHERE OTP_ID = :id AND OTP_CODE = :otp", conn);
-            checkCmd.BindByName = true;
-            checkCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
-            checkCmd.Parameters.Add("otp", otp);
+            using var checkCmd = new NpgsqlCommand(@"
+                SELECT COUNT(*) FROM phone_otps WHERE otp_id = @id AND otp_code = @otp", conn);
+            checkCmd.Parameters.AddWithValue("id", otpId);
+            checkCmd.Parameters.AddWithValue("otp", otp);
 
             if (Convert.ToInt32(checkCmd.ExecuteScalar()) == 0)
             {
                 wrong++;
-                var failCmd = new OracleCommand(@"
-                    UPDATE PHONE_OTPS SET WRONG_ATTEMPTS = :wrong,
-                           USED = CASE WHEN :wrong >= :max THEN 1 ELSE USED END
-                    WHERE OTP_ID = :id", conn);
-                failCmd.BindByName = true;
-                failCmd.Parameters.Add("wrong", OracleDbType.Int32).Value = wrong;
-                failCmd.Parameters.Add("max", OracleDbType.Int32).Value = MaxWrongAttempts;
-                failCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
+                using var failCmd = new NpgsqlCommand(@"
+                    UPDATE phone_otps SET wrong_attempts = @wrong,
+                           used = CASE WHEN @wrong >= @max THEN TRUE ELSE used END
+                    WHERE otp_id = @id", conn);
+                failCmd.Parameters.AddWithValue("wrong", wrong);
+                failCmd.Parameters.AddWithValue("max", MaxWrongAttempts);
+                failCmd.Parameters.AddWithValue("id", otpId);
                 failCmd.ExecuteNonQuery();
                 return false;
             }
 
-            var markCmd = new OracleCommand("UPDATE PHONE_OTPS SET USED = 1 WHERE OTP_ID = :id", conn);
-            markCmd.BindByName = true;
-            markCmd.Parameters.Add("id", OracleDbType.Int32).Value = otpId;
+            using var markCmd = new NpgsqlCommand(
+                "UPDATE phone_otps SET used = TRUE WHERE otp_id = @id", conn);
+            markCmd.Parameters.AddWithValue("id", otpId);
             markCmd.ExecuteNonQuery();
             return true;
         }

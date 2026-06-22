@@ -1,7 +1,8 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using FullSummpotAPI.Data;
+using FullSummpotAPI.DTOs;
 using System.Security.Claims;
 
 namespace FullSummpotAPI.Controllers
@@ -11,19 +12,13 @@ namespace FullSummpotAPI.Controllers
     [Authorize]
     public class UserController : ControllerBase
     {
-        private readonly OracleDbContext _db;
+        private readonly NpgsqlDbContext _db;
         private readonly PasswordService _passwordService;
         private static readonly HashSet<string> AllowedNiches = new(StringComparer.OrdinalIgnoreCase)
-        {
-            "Gaming","Tech","Education","Music","Comedy","Vlogging",
-            "Finance","Fitness","Food","Travel","Other"
-        };
+        { "Gaming","Tech","Education","Music","Comedy","Vlogging","Finance","Fitness","Food","Travel","Other" };
 
-        public UserController(OracleDbContext db, PasswordService passwordService)
-        {
-            _db = db;
-            _passwordService = passwordService;
-        }
+        public UserController(NpgsqlDbContext db, PasswordService passwordService)
+        { _db = db; _passwordService = passwordService; }
 
         private int GetCurrentUserId()
         {
@@ -31,169 +26,163 @@ namespace FullSummpotAPI.Controllers
             return string.IsNullOrEmpty(claim) ? 0 : Convert.ToInt32(claim);
         }
 
-        // -- Search --------------------------------------------------------------
         [HttpGet("search")]
         public IActionResult Search([FromQuery] string query)
         {
             if (string.IsNullOrWhiteSpace(query))
                 return Ok(new { users = Array.Empty<object>(), communities = Array.Empty<object>() });
 
-            int currentUserId = GetCurrentUserId();
-
+            int uid = GetCurrentUserId();
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var userCmd = new OracleCommand(@"
-                SELECT u.USER_ID, u.USERNAME, u.AVATAR_URL,
-                       NVL(f.STATUS, 'NONE') as FOLLOW_STATUS
-                FROM USERS u
-                LEFT JOIN FOLLOWS f ON f.FOLLOWING_ID = u.USER_ID AND f.FOLLOWER_ID = :currentUserId
-                WHERE LOWER(u.USERNAME) LIKE :q
-                  AND u.USER_ID != :currentUserId
-                FETCH FIRST 30 ROWS ONLY", conn);
-            userCmd.BindByName = true;
-            userCmd.Parameters.Add("currentUserId", OracleDbType.Int32).Value = currentUserId;
-            userCmd.Parameters.Add("q", OracleDbType.Varchar2).Value = $"%{query.ToLower()}%";
-
+            using var userCmd = new NpgsqlCommand(@"
+                SELECT u.user_id, u.username, u.avatar_url,
+                       COALESCE(f.status, 'NONE') AS follow_status
+                FROM users u
+                LEFT JOIN follows f ON f.following_id = u.user_id AND f.follower_id = @uid
+                WHERE LOWER(u.username) LIKE @q AND u.user_id != @uid
+                LIMIT 30", conn);
+            userCmd.Parameters.AddWithValue("uid", uid);
+            userCmd.Parameters.AddWithValue("q", $"%{query.ToLower()}%");
             using var userReader = userCmd.ExecuteReader();
             var users = new List<object>();
             while (userReader.Read())
             {
                 users.Add(new
                 {
-                    userId    = Convert.ToInt32(userReader["USER_ID"]),
-                    username  = userReader["USERNAME"].ToString(),
-                    avatarUrl = userReader["AVATAR_URL"] == DBNull.Value ? null : userReader["AVATAR_URL"].ToString(),
-                    followStatus = userReader["FOLLOW_STATUS"].ToString()
+                    userId       = Convert.ToInt32(userReader["user_id"]),
+                    username     = userReader["username"].ToString(),
+                    avatarUrl    = userReader["avatar_url"] == DBNull.Value ? null : userReader["avatar_url"].ToString(),
+                    followStatus = userReader["follow_status"].ToString()
                 });
             }
+            userReader.Close();
 
-            var commCmd = new OracleCommand(@"
-                SELECT c.COMMUNITY_ID, c.NAME, c.NICHE, u.USERNAME as CREATOR_NAME
-                FROM COMMUNITIES c
-                JOIN USERS u ON c.CREATED_BY = u.USER_ID
-                WHERE LOWER(c.NAME) LIKE :q OR LOWER(c.NICHE) LIKE :q OR LOWER(u.USERNAME) LIKE :q
-                FETCH FIRST 30 ROWS ONLY", conn);
-            commCmd.BindByName = true;
-            commCmd.Parameters.Add("q", OracleDbType.Varchar2).Value = $"%{query.ToLower()}%";
-
+            using var commCmd = new NpgsqlCommand(@"
+                SELECT c.community_id, c.name, c.niche, u.username AS creator_name
+                FROM communities c JOIN users u ON c.created_by = u.user_id
+                WHERE LOWER(c.name) LIKE @q OR LOWER(c.niche) LIKE @q OR LOWER(u.username) LIKE @q
+                LIMIT 30", conn);
+            commCmd.Parameters.AddWithValue("q", $"%{query.ToLower()}%");
             using var commReader = commCmd.ExecuteReader();
             var communities = new List<object>();
             while (commReader.Read())
             {
                 communities.Add(new
                 {
-                    communityId  = Convert.ToInt32(commReader["COMMUNITY_ID"]),
-                    name         = commReader["NAME"].ToString(),
-                    niche        = commReader["NICHE"].ToString(),
-                    creatorName  = commReader["CREATOR_NAME"].ToString()
+                    communityId = Convert.ToInt32(commReader["community_id"]),
+                    name        = commReader["name"].ToString(),
+                    niche       = commReader["niche"].ToString(),
+                    creatorName = commReader["creator_name"].ToString()
                 });
             }
-
             return Ok(new { users, communities });
         }
 
-        // -- Profile -------------------------------------------------------------
         [HttpGet("profile")]
         public IActionResult GetProfile()
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT USER_ID, USERNAME, EMAIL, CONTENT_NICHE,
-                       AVAILABLE_POINTS, AVATAR_URL, CREATED_AT,
-                       PHONE_NUMBER, IS_EMAIL_VERIFIED, IS_PHONE_VERIFIED
-                FROM USERS WHERE USER_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT user_id, username, email, content_niche,
+                       available_points, avatar_url, created_at,
+                       phone_number, is_email_verified, is_phone_verified
+                FROM users WHERE user_id = @id", conn);
+            cmd.Parameters.AddWithValue("id", uid);
             using var reader = cmd.ExecuteReader();
             if (!reader.Read()) return NotFound();
-
             return Ok(new
             {
-                id             = Convert.ToInt32(reader["USER_ID"]),
-                username       = reader["USERNAME"].ToString(),
-                email          = reader["EMAIL"].ToString(),
-                contentNiche   = reader["CONTENT_NICHE"] == DBNull.Value ? null : reader["CONTENT_NICHE"].ToString(),
-                availablePoints= reader["AVAILABLE_POINTS"] == DBNull.Value ? 0 : Convert.ToInt32(reader["AVAILABLE_POINTS"]),
-                avatarUrl      = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                createdAt      = reader["CREATED_AT"] == DBNull.Value ? null : Convert.ToDateTime(reader["CREATED_AT"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
-                phoneNumber    = reader["PHONE_NUMBER"] == DBNull.Value ? null : reader["PHONE_NUMBER"].ToString(),
-                isEmailVerified = Convert.ToInt32(reader["IS_EMAIL_VERIFIED"]) == 1,
-                isPhoneVerified = Convert.ToInt32(reader["IS_PHONE_VERIFIED"]) == 1
+                id              = Convert.ToInt32(reader["user_id"]),
+                username        = reader["username"].ToString(),
+                email           = reader["email"].ToString(),
+                contentNiche    = reader["content_niche"] == DBNull.Value ? null : reader["content_niche"].ToString(),
+                availablePoints = reader["available_points"] == DBNull.Value ? 0 : Convert.ToInt32(reader["available_points"]),
+                avatarUrl       = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(),
+                createdAt       = reader["created_at"] == DBNull.Value ? null : Convert.ToDateTime(reader["created_at"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                phoneNumber     = reader["phone_number"] == DBNull.Value ? null : reader["phone_number"].ToString(),
+                isEmailVerified = Convert.ToBoolean(reader["is_email_verified"]),
+                isPhoneVerified = Convert.ToBoolean(reader["is_phone_verified"])
             });
         }
 
         [HttpGet("{id:int}/public-profile")]
         public IActionResult GetPublicProfile(int id)
         {
-            int currentUserId = GetCurrentUserId();
-
+            int uid = GetCurrentUserId();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT u.USER_ID, u.USERNAME, u.CONTENT_NICHE, u.AVAILABLE_POINTS,
-                       u.AVATAR_URL, u.CREATED_AT,
-                       (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWING_ID = u.USER_ID AND STATUS = 'ACCEPTED') as FOLLOWERS_COUNT,
-                       (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWER_ID  = u.USER_ID AND STATUS = 'ACCEPTED') as FOLLOWING_COUNT,
-                       (SELECT COUNT(*) FROM COMMUNITIES WHERE CREATED_BY = u.USER_ID) as COMMUNITIES_CREATED,
-                       (SELECT COUNT(*) FROM LINKS WHERE USER_ID = u.USER_ID)          as LINKS_SUBMITTED,
-                       (SELECT NVL(SUM(CLICKS),0) FROM LINKS WHERE USER_ID = u.USER_ID) as TOTAL_CLICKS
-                FROM USERS u WHERE u.USER_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("id", OracleDbType.Int32).Value = id;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT u.user_id, u.username, u.content_niche, u.available_points, u.avatar_url, u.created_at,
+                    (SELECT COUNT(*) FROM follows WHERE following_id = u.user_id AND status = 'ACCEPTED') AS followers_count,
+                    (SELECT COUNT(*) FROM follows WHERE follower_id  = u.user_id AND status = 'ACCEPTED') AS following_count,
+                    (SELECT COUNT(*) FROM communities WHERE created_by = u.user_id) AS communities_created,
+                    (SELECT COUNT(*) FROM links WHERE user_id = u.user_id) AS links_submitted,
+                    (SELECT COALESCE(SUM(clicks),0) FROM links WHERE user_id = u.user_id) AS total_clicks
+                FROM users u WHERE u.user_id = @id", conn);
+            cmd.Parameters.AddWithValue("id", id);
             using var reader = cmd.ExecuteReader();
             if (!reader.Read()) return NotFound(new { message = "User not found" });
 
             string? followStatus = null;
-            if (currentUserId != 0 && currentUserId != id)
+            if (uid != 0 && uid != id)
             {
-                var followCmd = new OracleCommand(
-                    "SELECT STATUS FROM FOLLOWS WHERE FOLLOWER_ID = :f AND FOLLOWING_ID = :t", conn);
-                followCmd.BindByName = true;
-                followCmd.Parameters.Add("f", OracleDbType.Int32).Value = currentUserId;
-                followCmd.Parameters.Add("t", OracleDbType.Int32).Value = id;
+                reader.Close();
+                using var followCmd = new NpgsqlCommand(
+                    "SELECT status FROM follows WHERE follower_id = @f AND following_id = @t", conn);
+                followCmd.Parameters.AddWithValue("f", uid);
+                followCmd.Parameters.AddWithValue("t", id);
                 var result = followCmd.ExecuteScalar();
                 followStatus = (result == null || result == DBNull.Value) ? "NONE" : result.ToString();
+
+                using var cmd2 = new NpgsqlCommand(@"
+                    SELECT u.user_id, u.username, u.content_niche, u.available_points, u.avatar_url, u.created_at,
+                        (SELECT COUNT(*) FROM follows WHERE following_id = u.user_id AND status = 'ACCEPTED') AS followers_count,
+                        (SELECT COUNT(*) FROM follows WHERE follower_id  = u.user_id AND status = 'ACCEPTED') AS following_count,
+                        (SELECT COUNT(*) FROM communities WHERE created_by = u.user_id) AS communities_created,
+                        (SELECT COUNT(*) FROM links WHERE user_id = u.user_id) AS links_submitted,
+                        (SELECT COALESCE(SUM(clicks),0) FROM links WHERE user_id = u.user_id) AS total_clicks
+                    FROM users u WHERE u.user_id = @id", conn);
+                cmd2.Parameters.AddWithValue("id", id);
+                using var reader2 = cmd2.ExecuteReader();
+                if (!reader2.Read()) return NotFound(new { message = "User not found" });
+                return Ok(BuildPublicProfile(reader2, followStatus, uid, id));
             }
 
-            return Ok(new
-            {
-                userId              = Convert.ToInt32(reader["USER_ID"]),
-                username            = reader["USERNAME"].ToString(),
-                contentNiche        = reader["CONTENT_NICHE"] == DBNull.Value ? null : reader["CONTENT_NICHE"].ToString(),
-                availablePoints     = Convert.ToInt32(reader["AVAILABLE_POINTS"]),
-                avatarUrl           = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                createdAt           = reader["CREATED_AT"] == DBNull.Value ? null : Convert.ToDateTime(reader["CREATED_AT"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
-                followersCount      = Convert.ToInt32(reader["FOLLOWERS_COUNT"]),
-                followingCount      = Convert.ToInt32(reader["FOLLOWING_COUNT"]),
-                communitiesCreated  = Convert.ToInt32(reader["COMMUNITIES_CREATED"]),
-                linksSubmitted      = Convert.ToInt32(reader["LINKS_SUBMITTED"]),
-                totalClicks         = Convert.ToInt32(reader["TOTAL_CLICKS"]),
-                followStatus        = followStatus,
-                isOwnProfile        = currentUserId == id
-            });
+            return Ok(BuildPublicProfile(reader, followStatus, uid, id));
         }
+
+        private static object BuildPublicProfile(NpgsqlDataReader reader, string? followStatus, int uid, int id) => new
+        {
+            userId             = Convert.ToInt32(reader["user_id"]),
+            username           = reader["username"].ToString(),
+            contentNiche       = reader["content_niche"] == DBNull.Value ? null : reader["content_niche"].ToString(),
+            availablePoints    = Convert.ToInt32(reader["available_points"]),
+            avatarUrl          = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(),
+            createdAt          = reader["created_at"] == DBNull.Value ? null : Convert.ToDateTime(reader["created_at"]).ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            followersCount     = Convert.ToInt32(reader["followers_count"]),
+            followingCount     = Convert.ToInt32(reader["following_count"]),
+            communitiesCreated = Convert.ToInt32(reader["communities_created"]),
+            linksSubmitted     = Convert.ToInt32(reader["links_submitted"]),
+            totalClicks        = Convert.ToInt32(reader["total_clicks"]),
+            followStatus,
+            isOwnProfile       = uid == id
+        };
 
         [HttpPut("profile")]
         public IActionResult UpdateProfile([FromBody] UpdateProfileDto dto)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
 
             if (!string.IsNullOrEmpty(dto.Username))
             {
                 if (dto.Username.Length < 3 || dto.Username.Length > 30)
-                    return BadRequest(new { message = "Username must be 3�30 characters." });
-
-                // Only allow alphanumeric + underscore
+                    return BadRequest(new { message = "Username must be 3-30 characters." });
                 if (!System.Text.RegularExpressions.Regex.IsMatch(dto.Username, @"^[a-zA-Z0-9_]+$"))
                     return BadRequest(new { message = "Username can only contain letters, numbers and underscores." });
             }
@@ -206,63 +195,47 @@ namespace FullSummpotAPI.Controllers
 
             if (!string.IsNullOrEmpty(dto.Username))
             {
-                var checkCmd = new OracleCommand(
-                    "SELECT COUNT(*) FROM USERS WHERE LOWER(USERNAME) = LOWER(:username) AND USER_ID != :id", conn);
-                checkCmd.BindByName = true;
-                checkCmd.Parameters.Add("username", OracleDbType.Varchar2).Value = dto.Username;
-                checkCmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
+                using var checkCmd = new NpgsqlCommand(
+                    "SELECT COUNT(*) FROM users WHERE LOWER(username) = LOWER(@u) AND user_id != @id", conn);
+                checkCmd.Parameters.AddWithValue("u", dto.Username);
+                checkCmd.Parameters.AddWithValue("id", uid);
                 if (Convert.ToInt32(checkCmd.ExecuteScalar()) > 0)
                     return BadRequest(new { message = "Username is already taken." });
             }
 
-            var cmd = new OracleCommand(@"
-                UPDATE USERS SET
-                    USERNAME      = COALESCE(:username, USERNAME),
-                    CONTENT_NICHE = COALESCE(:niche, CONTENT_NICHE)
-                WHERE USER_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("username", OracleDbType.Varchar2).Value =
-                string.IsNullOrEmpty(dto.Username) ? (object)DBNull.Value : dto.Username;
-            cmd.Parameters.Add("niche", OracleDbType.Varchar2).Value =
-                string.IsNullOrEmpty(dto.ContentNiche) ? (object)DBNull.Value : dto.ContentNiche;
-            cmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
+            using var cmd = new NpgsqlCommand(@"
+                UPDATE users SET
+                    username      = COALESCE(@username, username),
+                    content_niche = COALESCE(@niche, content_niche)
+                WHERE user_id = @id", conn);
+            cmd.Parameters.AddWithValue("username", string.IsNullOrEmpty(dto.Username) ? DBNull.Value : (object)dto.Username);
+            cmd.Parameters.AddWithValue("niche",    string.IsNullOrEmpty(dto.ContentNiche) ? DBNull.Value : (object)dto.ContentNiche);
+            cmd.Parameters.AddWithValue("id", uid);
             cmd.ExecuteNonQuery();
-
             return Ok(new { message = "Profile updated successfully" });
         }
 
-        // -- Avatar upload --------------------------------------------------------
         [HttpPost("upload-avatar")]
         public async Task<IActionResult> UploadAvatar(IFormFile file)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
-            if (file == null || file.Length == 0)
-                return BadRequest(new { message = "No file uploaded." });
-
-            if (file.Length > 5 * 1024 * 1024)
-                return BadRequest(new { message = "File must be under 5 MB." });
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
+            if (file == null || file.Length == 0) return BadRequest(new { message = "No file uploaded." });
+            if (file.Length > 5 * 1024 * 1024) return BadRequest(new { message = "File must be under 5 MB." });
             var allowedTypes = new[] { "image/jpeg", "image/png", "image/webp", "image/gif" };
-            if (!allowedTypes.Contains(file.ContentType.ToLower()))
-                return BadRequest(new { message = "Only JPEG, PNG, WebP and GIF images are allowed." });
-
+            if (!allowedTypes.Contains(file.ContentType.ToLower())) return BadRequest(new { message = "Only JPEG, PNG, WebP and GIF images are allowed." });
             var ext = Path.GetExtension(file.FileName).ToLower();
             var allowedExts = new[] { ".jpg", ".jpeg", ".png", ".webp", ".gif" };
-            if (!allowedExts.Contains(ext))
-                return BadRequest(new { message = "Invalid file extension." });
+            if (!allowedExts.Contains(ext)) return BadRequest(new { message = "Invalid file extension." });
 
             var uploadsPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", "avatars");
             Directory.CreateDirectory(uploadsPath);
 
-            // Delete old avatar file if it exists
             using (var conn2 = _db.GetConnection())
             {
                 conn2.Open();
-                var oldCmd = new OracleCommand("SELECT AVATAR_URL FROM USERS WHERE USER_ID = :id", conn2);
-                oldCmd.BindByName = true;
-                oldCmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
+                using var oldCmd = new NpgsqlCommand("SELECT avatar_url FROM users WHERE user_id = @id", conn2);
+                oldCmd.Parameters.AddWithValue("id", uid);
                 var oldUrl = oldCmd.ExecuteScalar()?.ToString();
                 if (!string.IsNullOrEmpty(oldUrl))
                 {
@@ -271,272 +244,202 @@ namespace FullSummpotAPI.Controllers
                 }
             }
 
-            var safeFileName = $"avatar_{currentUserId}_{DateTime.UtcNow.Ticks}{ext}";
+            var safeFileName = $"avatar_{uid}_{DateTime.UtcNow.Ticks}{ext}";
             var filePath = Path.Combine(uploadsPath, safeFileName);
-
             using (var stream = new FileStream(filePath, FileMode.Create))
                 await file.CopyToAsync(stream);
 
             var publicUrl = $"/uploads/avatars/{safeFileName}";
-
             using var conn = _db.GetConnection();
             conn.Open();
-            var cmd = new OracleCommand("UPDATE USERS SET AVATAR_URL = :url WHERE USER_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("url", OracleDbType.Varchar2).Value = publicUrl;
-            cmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
+            using var cmd = new NpgsqlCommand("UPDATE users SET avatar_url = @url WHERE user_id = @id", conn);
+            cmd.Parameters.AddWithValue("url", publicUrl);
+            cmd.Parameters.AddWithValue("id",  uid);
             cmd.ExecuteNonQuery();
-
             return Ok(new { avatarUrl = publicUrl });
         }
 
-        // -- Follow system --------------------------------------------------------
         [HttpPost("follow/{id:int}")]
         public IActionResult Follow(int id)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-            if (currentUserId == id) return BadRequest(new { message = "You cannot follow yourself." });
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
+            if (uid == id) return BadRequest(new { message = "You cannot follow yourself." });
 
             using var conn = _db.GetConnection();
             conn.Open();
 
-            // Check target user exists
-            var existsCmd = new OracleCommand("SELECT COUNT(*) FROM USERS WHERE USER_ID = :id", conn);
-            existsCmd.BindByName = true;
-            existsCmd.Parameters.Add("id", OracleDbType.Int32).Value = id;
-            if (Convert.ToInt32(existsCmd.ExecuteScalar()) == 0)
-                return NotFound(new { message = "User not found." });
+            using (var existsCmd = new NpgsqlCommand("SELECT COUNT(*) FROM users WHERE user_id = @id", conn))
+            {
+                existsCmd.Parameters.AddWithValue("id", id);
+                if (Convert.ToInt32(existsCmd.ExecuteScalar()) == 0) return NotFound(new { message = "User not found." });
+            }
 
-            var checkCmd = new OracleCommand(
-                "SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWER_ID = :f AND FOLLOWING_ID = :t", conn);
-            checkCmd.BindByName = true;
-            checkCmd.Parameters.Add("f", OracleDbType.Int32).Value = currentUserId;
-            checkCmd.Parameters.Add("t", OracleDbType.Int32).Value = id;
-            if (Convert.ToInt32(checkCmd.ExecuteScalar()) > 0)
-                return BadRequest(new { message = "Already following or request pending." });
+            using (var checkCmd = new NpgsqlCommand("SELECT COUNT(*) FROM follows WHERE follower_id = @f AND following_id = @t", conn))
+            {
+                checkCmd.Parameters.AddWithValue("f", uid);
+                checkCmd.Parameters.AddWithValue("t", id);
+                if (Convert.ToInt32(checkCmd.ExecuteScalar()) > 0)
+                    return BadRequest(new { message = "Already following or request pending." });
+            }
 
-            var followCmd = new OracleCommand(
-                "INSERT INTO FOLLOWS (FOLLOWER_ID, FOLLOWING_ID, STATUS) VALUES (:f, :t, 'PENDING')", conn);
-            followCmd.BindByName = true;
-            followCmd.Parameters.Add("f", OracleDbType.Int32).Value = currentUserId;
-            followCmd.Parameters.Add("t", OracleDbType.Int32).Value = id;
-            followCmd.ExecuteNonQuery();
+            using (var followCmd = new NpgsqlCommand("INSERT INTO follows (follower_id, following_id, status) VALUES (@f, @t, 'PENDING')", conn))
+            {
+                followCmd.Parameters.AddWithValue("f", uid);
+                followCmd.Parameters.AddWithValue("t", id);
+                followCmd.ExecuteNonQuery();
+            }
 
-            var nameCmd = new OracleCommand("SELECT USERNAME FROM USERS WHERE USER_ID = :id", conn);
-            nameCmd.BindByName = true;
-            nameCmd.Parameters.Add("id", OracleDbType.Int32).Value = currentUserId;
-            var senderName = nameCmd.ExecuteScalar()?.ToString() ?? $"User {currentUserId}";
+            using var nameCmd = new NpgsqlCommand("SELECT username FROM users WHERE user_id = @id", conn);
+            nameCmd.Parameters.AddWithValue("id", uid);
+            var senderName = nameCmd.ExecuteScalar()?.ToString() ?? $"User {uid}";
 
-            var notifCmd = new OracleCommand(@"
-                INSERT INTO NOTIFICATIONS (USER_ID, SENDER_ID, TYPE, MESSAGE)
-                VALUES (:u, :s, 'FOLLOW_REQUEST', :m)", conn);
-            notifCmd.BindByName = true;
-            notifCmd.Parameters.Add("u", OracleDbType.Int32).Value = id;
-            notifCmd.Parameters.Add("s", OracleDbType.Int32).Value = currentUserId;
-            notifCmd.Parameters.Add("m", OracleDbType.Varchar2).Value = $"{senderName} wants to follow you.";
+            using var notifCmd = new NpgsqlCommand(@"
+                INSERT INTO notifications (user_id, sender_id, type, message)
+                VALUES (@u, @s, 'FOLLOW_REQUEST', @m)", conn);
+            notifCmd.Parameters.AddWithValue("u", id);
+            notifCmd.Parameters.AddWithValue("s", uid);
+            notifCmd.Parameters.AddWithValue("m", $"{senderName} wants to follow you.");
             notifCmd.ExecuteNonQuery();
-
             return Ok(new { message = "Follow request sent" });
         }
 
         [HttpPost("follow-accept/{senderId:int}")]
         public IActionResult AcceptFollow(int senderId)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
+            using var updateCmd = new NpgsqlCommand(
+                "UPDATE follows SET status = 'ACCEPTED' WHERE follower_id = @s AND following_id = @u AND status = 'PENDING'", conn);
+            updateCmd.Parameters.AddWithValue("s", senderId);
+            updateCmd.Parameters.AddWithValue("u", uid);
+            if (updateCmd.ExecuteNonQuery() == 0) return BadRequest(new { message = "No pending request found." });
 
-            var updateCmd = new OracleCommand(
-                "UPDATE FOLLOWS SET STATUS = 'ACCEPTED' WHERE FOLLOWER_ID = :s AND FOLLOWING_ID = :u AND STATUS = 'PENDING'", conn);
-            updateCmd.BindByName = true;
-            updateCmd.Parameters.Add("s", OracleDbType.Int32).Value = senderId;
-            updateCmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-            if (updateCmd.ExecuteNonQuery() == 0)
-                return BadRequest(new { message = "No pending request found." });
-
-            var delNotif = new OracleCommand(@"
-                DELETE FROM NOTIFICATIONS
-                WHERE USER_ID = :u AND SENDER_ID = :s AND TYPE = 'FOLLOW_REQUEST'", conn);
-            delNotif.BindByName = true;
-            delNotif.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-            delNotif.Parameters.Add("s", OracleDbType.Int32).Value = senderId;
+            using var delNotif = new NpgsqlCommand(
+                "DELETE FROM notifications WHERE user_id = @u AND sender_id = @s AND type = 'FOLLOW_REQUEST'", conn);
+            delNotif.Parameters.AddWithValue("u", uid);
+            delNotif.Parameters.AddWithValue("s", senderId);
             delNotif.ExecuteNonQuery();
-
             return Ok(new { message = "Follow request accepted" });
         }
 
         [HttpPost("follow-decline/{senderId:int}")]
         public IActionResult DeclineFollow(int senderId)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var deleteCmd = new OracleCommand(
-                "DELETE FROM FOLLOWS WHERE FOLLOWER_ID = :s AND FOLLOWING_ID = :u AND STATUS = 'PENDING'", conn);
-            deleteCmd.BindByName = true;
-            deleteCmd.Parameters.Add("s", OracleDbType.Int32).Value = senderId;
-            deleteCmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-            deleteCmd.ExecuteNonQuery();
-
+            using var cmd = new NpgsqlCommand(
+                "DELETE FROM follows WHERE follower_id = @s AND following_id = @u AND status = 'PENDING'", conn);
+            cmd.Parameters.AddWithValue("s", senderId);
+            cmd.Parameters.AddWithValue("u", uid);
+            cmd.ExecuteNonQuery();
             return Ok(new { message = "Follow request declined" });
         }
 
         [HttpPost("{id:int}/unfollow")]
         public IActionResult Unfollow(int id)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(
-                "DELETE FROM FOLLOWS WHERE FOLLOWER_ID = :f AND FOLLOWING_ID = :t", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("f", OracleDbType.Int32).Value = currentUserId;
-            cmd.Parameters.Add("t", OracleDbType.Int32).Value = id;
+            using var cmd = new NpgsqlCommand("DELETE FROM follows WHERE follower_id = @f AND following_id = @t", conn);
+            cmd.Parameters.AddWithValue("f", uid);
+            cmd.Parameters.AddWithValue("t", id);
             cmd.ExecuteNonQuery();
-
             return Ok(new { message = "Unfollowed" });
         }
 
         [HttpPost("{id:int}/block")]
         public IActionResult Block(int id)
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-            if (currentUserId == id) return BadRequest(new { message = "Cannot block yourself." });
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
+            if (uid == id) return BadRequest(new { message = "Cannot block yourself." });
             using var conn = _db.GetConnection();
             conn.Open();
-
-            // Remove any existing follow relationship
-            var delFollow = new OracleCommand(@"
-                DELETE FROM FOLLOWS
-                WHERE (FOLLOWER_ID = :a AND FOLLOWING_ID = :b)
-                   OR (FOLLOWER_ID = :b AND FOLLOWING_ID = :a)", conn);
-            delFollow.BindByName = true;
-            delFollow.Parameters.Add("a", OracleDbType.Int32).Value = currentUserId;
-            delFollow.Parameters.Add("b", OracleDbType.Int32).Value = id;
-            delFollow.ExecuteNonQuery();
-
+            using var cmd = new NpgsqlCommand(@"
+                DELETE FROM follows
+                WHERE (follower_id = @a AND following_id = @b)
+                   OR (follower_id = @b AND following_id = @a)", conn);
+            cmd.Parameters.AddWithValue("a", uid);
+            cmd.Parameters.AddWithValue("b", id);
+            cmd.ExecuteNonQuery();
             return Ok(new { message = "User blocked" });
         }
 
         [HttpPost("{id:int}/unblock")]
-        public IActionResult Unblock(int id)
-        {
-            // Placeholder � extend with a BLOCKS table if needed
-            return Ok(new { message = "User unblocked" });
-        }
+        public IActionResult Unblock(int id) => Ok(new { message = "User unblocked" });
 
-        // -- Followers / Following ------------------------------------------------
         [HttpGet("followers")]
         public IActionResult GetFollowers()
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT u.USER_ID, u.USERNAME, u.AVATAR_URL
-                FROM FOLLOWS f
-                JOIN USERS u ON f.FOLLOWER_ID = u.USER_ID
-                WHERE f.FOLLOWING_ID = :u AND f.STATUS = 'ACCEPTED'", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT u.user_id, u.username, u.avatar_url
+                FROM follows f JOIN users u ON f.follower_id = u.user_id
+                WHERE f.following_id = @u AND f.status = 'ACCEPTED'", conn);
+            cmd.Parameters.AddWithValue("u", uid);
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
             while (reader.Read())
-            {
-                list.Add(new
-                {
-                    userId    = Convert.ToInt32(reader["USER_ID"]),
-                    username  = reader["USERNAME"].ToString(),
-                    avatarUrl = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString()
-                });
-            }
+                list.Add(new { userId = Convert.ToInt32(reader["user_id"]), username = reader["username"].ToString(), avatarUrl = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString() });
             return Ok(list);
         }
 
         [HttpGet("following")]
         public IActionResult GetFollowing()
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT u.USER_ID, u.USERNAME, u.AVATAR_URL,
-                       (SELECT COUNT(*) FROM COMMUNITIES WHERE CREATED_BY = u.USER_ID) as COMMUNITY_COUNT
-                FROM FOLLOWS f
-                JOIN USERS u ON f.FOLLOWING_ID = u.USER_ID
-                WHERE f.FOLLOWER_ID = :u AND f.STATUS = 'ACCEPTED'", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT u.user_id, u.username, u.avatar_url,
+                       (SELECT COUNT(*) FROM communities WHERE created_by = u.user_id) AS community_count
+                FROM follows f JOIN users u ON f.following_id = u.user_id
+                WHERE f.follower_id = @u AND f.status = 'ACCEPTED'", conn);
+            cmd.Parameters.AddWithValue("u", uid);
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
             while (reader.Read())
-            {
-                list.Add(new
-                {
-                    userId         = Convert.ToInt32(reader["USER_ID"]),
-                    username       = reader["USERNAME"].ToString(),
-                    avatarUrl      = reader["AVATAR_URL"] == DBNull.Value ? null : reader["AVATAR_URL"].ToString(),
-                    communityCount = Convert.ToInt32(reader["COMMUNITY_COUNT"])
-                });
-            }
+                list.Add(new { userId = Convert.ToInt32(reader["user_id"]), username = reader["username"].ToString(), avatarUrl = reader["avatar_url"] == DBNull.Value ? null : reader["avatar_url"].ToString(), communityCount = Convert.ToInt32(reader["community_count"]) });
             return Ok(list);
         }
 
-        // -- Notifications --------------------------------------------------------
         [HttpGet("notifications")]
         public IActionResult GetNotifications()
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(@"
-                SELECT n.NOTIFICATION_ID, n.SENDER_ID, n.TYPE, n.MESSAGE,
-                       n.IS_READ, n.CREATED_AT, u.USERNAME as SENDER_NAME
-                FROM NOTIFICATIONS n
-                JOIN USERS u ON n.SENDER_ID = u.USER_ID
-                WHERE n.USER_ID = :u
-                ORDER BY n.CREATED_AT DESC
-                FETCH FIRST 50 ROWS ONLY", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
-
+            using var cmd = new NpgsqlCommand(@"
+                SELECT n.notification_id, n.sender_id, n.type, n.message,
+                       n.is_read, n.created_at, u.username AS sender_name
+                FROM notifications n JOIN users u ON n.sender_id = u.user_id
+                WHERE n.user_id = @u ORDER BY n.created_at DESC LIMIT 50", conn);
+            cmd.Parameters.AddWithValue("u", uid);
             using var reader = cmd.ExecuteReader();
             var list = new List<object>();
             while (reader.Read())
             {
                 list.Add(new
                 {
-                    id         = Convert.ToInt32(reader["NOTIFICATION_ID"]),
-                    senderId   = Convert.ToInt32(reader["SENDER_ID"]),
-                    senderName = reader["SENDER_NAME"].ToString(),
-                    type       = reader["TYPE"].ToString(),
-                    message    = reader["MESSAGE"].ToString(),
-                    isRead     = Convert.ToInt32(reader["IS_READ"]) == 1,
-                    createdAt  = DateTime.SpecifyKind(
-                        reader.GetDateTime(reader.GetOrdinal("CREATED_AT")),
-                        DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    id         = Convert.ToInt32(reader["notification_id"]),
+                    senderId   = Convert.ToInt32(reader["sender_id"]),
+                    senderName = reader["sender_name"].ToString(),
+                    type       = reader["type"].ToString(),
+                    message    = reader["message"].ToString(),
+                    isRead     = Convert.ToBoolean(reader["is_read"]),
+                    createdAt  = DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("created_at")), DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ")
                 });
             }
             return Ok(list);
@@ -545,90 +448,14 @@ namespace FullSummpotAPI.Controllers
         [HttpPost("notifications/read-all")]
         public IActionResult MarkNotificationsRead()
         {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
+            int uid = GetCurrentUserId();
+            if (uid == 0) return Unauthorized();
             using var conn = _db.GetConnection();
             conn.Open();
-
-            var cmd = new OracleCommand(
-                "UPDATE NOTIFICATIONS SET IS_READ = 1 WHERE USER_ID = :u AND IS_READ = 0", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("u", OracleDbType.Int32).Value = currentUserId;
+            using var cmd = new NpgsqlCommand("UPDATE notifications SET is_read = TRUE WHERE user_id = @u", conn);
+            cmd.Parameters.AddWithValue("u", uid);
             cmd.ExecuteNonQuery();
-
-            return Ok(new { success = true, message = "Notifications marked as read" });
+            return Ok(new { message = "All notifications marked as read" });
         }
-
-        [HttpDelete("notifications/{notificationId:int}")]
-        public IActionResult DeleteNotification(int notificationId)
-        {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
-            using var conn = _db.GetConnection();
-            conn.Open();
-
-            // Scoped to current user � prevents deleting other users notifications
-            var cmd = new OracleCommand(
-                "DELETE FROM NOTIFICATIONS WHERE NOTIFICATION_ID = :id AND USER_ID = :userId", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("id", OracleDbType.Int32).Value = notificationId;
-            cmd.Parameters.Add("userId", OracleDbType.Int32).Value = currentUserId;
-            cmd.ExecuteNonQuery();
-
-            return Ok(new { success = true });
-        }
-
-        // -- Change Password ------------------------------------------------------
-        [HttpPost("change-password")]
-        public IActionResult ChangePassword([FromBody] ChangePasswordDto dto)
-        {
-            int currentUserId = GetCurrentUserId();
-            if (currentUserId == 0) return Unauthorized();
-
-            if (string.IsNullOrWhiteSpace(dto.CurrentPassword) ||
-                string.IsNullOrWhiteSpace(dto.NewPassword))
-                return BadRequest(new { message = "Both passwords are required." });
-
-            if (dto.NewPassword.Length < 8)
-                return BadRequest(new { message = "New password must be at least 8 characters." });
-
-            using var conn = _db.GetConnection();
-            conn.Open();
-
-            var cmd = new OracleCommand(
-                "SELECT PASSWORD_HASH FROM USERS WHERE USER_ID = :idParam", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add("idParam", OracleDbType.Int32).Value = currentUserId;
-            var storedHash = cmd.ExecuteScalar()?.ToString();
-
-            if (storedHash == null || !_passwordService.VerifyPassword(dto.CurrentPassword, storedHash))
-                return BadRequest(new { message = "Current password is incorrect." });
-
-            var newHash = _passwordService.HashPassword(dto.NewPassword);
-
-            var updateCmd = new OracleCommand(
-                "UPDATE USERS SET PASSWORD_HASH = :hashParam WHERE USER_ID = :idParam", conn);
-            updateCmd.BindByName = true;
-            updateCmd.Parameters.Add("hashParam", OracleDbType.Varchar2).Value = newHash;
-            updateCmd.Parameters.Add("idParam", OracleDbType.Int32).Value = currentUserId;
-            updateCmd.ExecuteNonQuery();
-
-            return Ok(new { message = "Password updated successfully." });
-        }
-
-        // -- DTOs -----------------------------------------------------------------
-        public class UpdateProfileDto
-        {
-            public string? Username { get; set; }
-            public string? ContentNiche { get; set; }
-        }
-    }
-
-    public class ChangePasswordDto
-    {
-        public string CurrentPassword { get; set; } = "";
-        public string NewPassword { get; set; } = "";
     }
 }

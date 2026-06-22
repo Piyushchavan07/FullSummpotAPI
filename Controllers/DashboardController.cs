@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Oracle.ManagedDataAccess.Client;
+using Npgsql;
 using FullSummpotAPI.Data;
 using System.Security.Claims;
 
@@ -11,81 +11,75 @@ namespace FullSummpotAPI.Controllers
     [Authorize]
     public class DashboardController : ControllerBase
     {
-        private readonly OracleDbContext _db;
-
-        public DashboardController(OracleDbContext db)
-        {
-            _db = db;
-        }
+        private readonly NpgsqlDbContext _db;
+        public DashboardController(NpgsqlDbContext db) => _db = db;
 
         [HttpGet]
         public IActionResult GetDashboard()
         {
             var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
             if (userId == null) return Unauthorized();
+            int uid = Convert.ToInt32(userId);
 
             using var conn = _db.GetConnection();
             conn.Open();
 
-            var cmd = new OracleCommand(@"
-                SELECT u.USERNAME, u.CONTENT_NICHE, u.AVAILABLE_POINTS,
-                       u.POINTS_EARNED_TODAY, u.VIEWS_GIVEN_TODAY,
-                       u.COMMUNITIES_JOINED, u.AVATAR_URL, u.ROLE,
-                       (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWING_ID = :id AND STATUS = 'ACCEPTED') as FOLLOWERS_COUNT,
-                       (SELECT COUNT(*) FROM FOLLOWS WHERE FOLLOWER_ID = :id AND STATUS = 'ACCEPTED') as FOLLOWING_COUNT
-                FROM USERS u
-                WHERE u.USER_ID = :id", conn);
-            cmd.BindByName = true;
-            cmd.Parameters.Add(new OracleParameter("id", userId));
+            using var cmd = new NpgsqlCommand(@"
+                SELECT u.username, u.content_niche, u.available_points, u.avatar_url, u.role,
+                       (SELECT COUNT(*) FROM follows WHERE following_id = @id AND status = 'ACCEPTED') AS followers_count,
+                       (SELECT COUNT(*) FROM follows WHERE follower_id  = @id AND status = 'ACCEPTED') AS following_count
+                FROM users u WHERE u.user_id = @id", conn);
+            cmd.Parameters.AddWithValue("id", uid);
 
             using var reader = cmd.ExecuteReader();
             if (!reader.Read()) return NotFound();
 
-            var followingCommunities = new List<object>();
+            var username        = reader["username"]?.ToString();
+            var contentNiche    = reader["content_niche"]?.ToString();
+            var availablePoints = Convert.ToInt32(reader["available_points"]);
+            var avatarUrl       = reader["avatar_url"]?.ToString();
+            var role            = reader["role"]?.ToString() ?? "USER";
+            var followersCount  = Convert.ToInt32(reader["followers_count"]);
+            var followingCount  = Convert.ToInt32(reader["following_count"]);
+            reader.Close();
 
-            var commCmd = new OracleCommand(@"
-                SELECT c.COMMUNITY_ID, c.NAME, c.NICHE, c.CREATED_AT,
-                       c.BANNER_URL,
-                       u.USERNAME as CREATOR_NAME, u.AVATAR_URL as CREATOR_AVATAR,
-                       (SELECT URL FROM (SELECT URL FROM LINKS WHERE COMMUNITY_ID = c.COMMUNITY_ID ORDER BY CREATED_AT DESC) WHERE ROWNUM = 1) AS LATEST_LINK_URL
-                FROM COMMUNITIES c
-                JOIN USERS u ON c.CREATED_BY = u.USER_ID
-                JOIN FOLLOWS f ON f.FOLLOWING_ID = u.USER_ID
-                WHERE f.FOLLOWER_ID = :id AND f.STATUS = 'ACCEPTED'
-                ORDER BY c.CREATED_AT DESC", conn);
-            commCmd.BindByName = true;
-            commCmd.Parameters.Add(new OracleParameter("id", userId));
+            var followingCommunities = new List<object>();
+            using var commCmd = new NpgsqlCommand(@"
+                SELECT c.community_id, c.name, c.niche, c.created_at, c.banner_url,
+                       u2.username AS creator_name, u2.avatar_url AS creator_avatar,
+                       (SELECT url FROM links WHERE community_id = c.community_id ORDER BY created_at DESC LIMIT 1) AS latest_link_url
+                FROM communities c
+                JOIN users u2 ON c.created_by = u2.user_id
+                JOIN follows f ON f.following_id = u2.user_id
+                WHERE f.follower_id = @id AND f.status = 'ACCEPTED'
+                ORDER BY c.created_at DESC", conn);
+            commCmd.Parameters.AddWithValue("id", uid);
 
             using var commReader = commCmd.ExecuteReader();
             while (commReader.Read())
             {
                 followingCommunities.Add(new
                 {
-                    communityId   = Convert.ToInt32(commReader["COMMUNITY_ID"]),
-                    name          = commReader["NAME"]?.ToString(),
-                    niche         = commReader["NICHE"]?.ToString(),
-                    bannerUrl     = commReader["BANNER_URL"] == DBNull.Value ? null : commReader["BANNER_URL"].ToString(),
-                    creatorName   = commReader["CREATOR_NAME"]?.ToString(),
-                    creatorAvatar = commReader["CREATOR_AVATAR"] == DBNull.Value ? null : commReader["CREATOR_AVATAR"].ToString(),
-                    latestLinkUrl = commReader["LATEST_LINK_URL"] == DBNull.Value ? null : commReader["LATEST_LINK_URL"].ToString(),
-                    createdAt     = DateTime.SpecifyKind(
-                        commReader.GetDateTime(commReader.GetOrdinal("CREATED_AT")),
-                        DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    communityId   = Convert.ToInt32(commReader["community_id"]),
+                    name          = commReader["name"]?.ToString(),
+                    niche         = commReader["niche"]?.ToString(),
+                    bannerUrl     = commReader["banner_url"] == DBNull.Value ? null : commReader["banner_url"].ToString(),
+                    creatorName   = commReader["creator_name"]?.ToString(),
+                    creatorAvatar = commReader["creator_avatar"] == DBNull.Value ? null : commReader["creator_avatar"].ToString(),
+                    latestLinkUrl = commReader["latest_link_url"] == DBNull.Value ? null : commReader["latest_link_url"].ToString(),
+                    createdAt     = DateTime.SpecifyKind(commReader.GetDateTime(commReader.GetOrdinal("created_at")), DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ")
                 });
             }
 
             return Ok(new
             {
-                username = reader["USERNAME"]?.ToString(),           // lowercase — matches frontend
-                contentNiche = reader["CONTENT_NICHE"]?.ToString(),
-                availablePoints = Convert.ToInt32(reader["AVAILABLE_POINTS"]),
-                pointsEarnedToday = Convert.ToInt32(reader["POINTS_EARNED_TODAY"]),
-                viewsGivenToday = Convert.ToInt32(reader["VIEWS_GIVEN_TODAY"]),
-                communitiesJoined = Convert.ToInt32(reader["COMMUNITIES_JOINED"]),
-                followersCount = Convert.ToInt32(reader["FOLLOWERS_COUNT"]),
-                followingCount = Convert.ToInt32(reader["FOLLOWING_COUNT"]),
-                avatarUrl = reader["AVATAR_URL"]?.ToString(),
-                role = reader["ROLE"]?.ToString() ?? "USER",
+                username,
+                contentNiche,
+                availablePoints,
+                followersCount,
+                followingCount,
+                avatarUrl,
+                role,
                 followingCommunities
             });
         }
