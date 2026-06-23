@@ -72,8 +72,10 @@ namespace FullSummpotAPI.Services
 
             using var client = new SmtpClient(_smtpHost, _smtpPort)
             {
-                EnableSsl   = true,
-                Credentials = new NetworkCredential(_fromEmail, _appPassword)
+                EnableSsl   = _smtpPort == 465,  // 465 = SSL, 587 = STARTTLS
+                Credentials = new NetworkCredential(_fromEmail, _appPassword),
+                DeliveryMethod = SmtpDeliveryMethod.Network,
+                Timeout = 30000
             };
 
             using var mail = new MailMessage
