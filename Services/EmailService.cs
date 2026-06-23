@@ -1,28 +1,27 @@
-using System.Net;
-using System.Net.Mail;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 
 namespace FullSummpotAPI.Services
 {
     public class EmailService
     {
-        private readonly string _smtpHost;
-        private readonly int    _smtpPort;
+        private readonly string _apiKey;
         private readonly string _fromEmail;
         private readonly string _fromName;
-        private readonly string _appPassword;
+        private readonly ILogger<EmailService> _logger;
 
-        public EmailService(IConfiguration config)
+        public EmailService(IConfiguration config, ILogger<EmailService> logger)
         {
-            _smtpHost    = config["Email:SmtpHost"]    ?? "smtp.gmail.com";
-            _smtpPort    = int.Parse(config["Email:SmtpPort"] ?? "587");
-            _fromEmail   = config["Email:FromEmail"]   ?? "";
-            _fromName    = config["Email:FromName"]    ?? "FullSumppot";
-            _appPassword = config["Email:AppPassword"] ?? "";
+            _logger    = logger;
+            _apiKey    = config["Brevo:ApiKey"] ?? "";
+            _fromEmail = config["Email:FromEmail"] ?? "fullsumppot.noreply@gmail.com";
+            _fromName  = config["Email:FromName"]  ?? "FullSumppot";
         }
 
         public async Task SendOtpEmailAsync(string toEmail, string otp, string purpose)
         {
-            bool isReset = purpose == "RESET_PASSWORD";
+            bool isReset    = purpose == "RESET_PASSWORD";
             bool isAddEmail = purpose == "ADD_EMAIL";
 
             var subject = isReset
@@ -31,14 +30,14 @@ namespace FullSummpotAPI.Services
                     ? $"{_fromName} — Verify New Email"
                     : $"{_fromName} — Verify Your Email";
 
-            var heading = isReset ? "Reset Your Password"
+            var heading  = isReset ? "Reset Your Password"
                 : isAddEmail ? "Verify Your New Email"
                 : "Verify Your Email Address";
 
             var bodyLine = isReset
                 ? "Use the code below to reset your password. It expires in <strong>15 minutes</strong>."
                 : isAddEmail
-                    ? "Use the code below to add this email to your FullSumppot account. It expires in <strong>15 minutes</strong>."
+                    ? "Use the code below to add this email to your account. It expires in <strong>15 minutes</strong>."
                     : "Use the code below to verify your email and activate your account. It expires in <strong>15 minutes</strong>.";
 
             var html = $@"
@@ -50,14 +49,14 @@ namespace FullSummpotAPI.Services
       <table width=""480"" cellpadding=""0"" cellspacing=""0""
              style=""background:#fff;border-radius:12px;padding:40px;box-shadow:0 2px 8px rgba(0,0,0,.08)"">
         <tr><td align=""center"" style=""padding-bottom:24px"">
-          <h2 style=""color:#7c3aed;margin:0"">{_fromName}</h2>
+          <h2 style=""color:#e53e3e;margin:0"">{_fromName}</h2>
         </td></tr>
         <tr><td>
           <h3 style=""color:#1f2937;margin-top:0"">{heading}</h3>
           <p style=""color:#6b7280"">{bodyLine}</p>
           <div style=""text-align:center;margin:32px 0"">
             <span style=""font-size:36px;font-weight:bold;letter-spacing:10px;
-                          color:#7c3aed;background:#f3f0ff;padding:16px 32px;
+                          color:#e53e3e;background:#fff5f5;padding:16px 32px;
                           border-radius:8px;display:inline-block"">{otp}</span>
           </div>
           <p style=""color:#9ca3af;font-size:13px"">
@@ -70,24 +69,31 @@ namespace FullSummpotAPI.Services
 </body>
 </html>";
 
-            using var client = new SmtpClient(_smtpHost, _smtpPort)
+            // Use Brevo HTTP API — not blocked by Railway unlike SMTP
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Add("api-key", _apiKey);
+            client.DefaultRequestHeaders.Accept.Add(
+                new MediaTypeWithQualityHeaderValue("application/json"));
+
+            var payload = new
             {
-                EnableSsl   = true,
-                Credentials = new NetworkCredential(_fromEmail, _appPassword),
-                DeliveryMethod = SmtpDeliveryMethod.Network,
-                Timeout = 30000
+                sender    = new { name = _fromName, email = _fromEmail },
+                to        = new[] { new { email = toEmail } },
+                subject,
+                htmlContent = html
             };
 
-            using var mail = new MailMessage
-            {
-                From       = new MailAddress(_fromEmail, _fromName),
-                Subject    = subject,
-                Body       = html,
-                IsBodyHtml = true
-            };
-            mail.To.Add(toEmail);
+            var content  = new StringContent(
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(
+                "https://api.brevo.com/v3/smtp/email", content);
+            var body     = await response.Content.ReadAsStringAsync();
 
-            await client.SendMailAsync(mail);
+            _logger.LogInformation("Brevo API response [{Status}]: {Body}",
+                (int)response.StatusCode, body);
+
+            if (!response.IsSuccessStatusCode)
+                throw new Exception($"Failed to send email via Brevo: {body}");
         }
     }
 }
